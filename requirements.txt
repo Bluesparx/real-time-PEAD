@@ -1,0 +1,4 @@
+httpx
+playwright
+pymongo
+logging
