@@ -1,146 +1,343 @@
-# api.py
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import os
+import logging
+from fastapi import FastAPI, HTTPException, Request, Query
+from pydantic import BaseModel, Field
 from pymongo import MongoClient
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 from bson.objectid import ObjectId
-from stock_predictor import StockPredictor # Import the prediction logic
+from pydantic import GetJsonSchemaHandler
+from pydantic.json_schema import JsonSchemaValue
+from starlette.middleware.base import BaseHTTPMiddleware
+import asyncio
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import time
 
-# --- Pydantic Schemas for API ---
+# NOTE: Assuming these are available in the API environment
+from analyzers.esm import ESMCalculator 
+from pipeline_orchestrator import PipelineOrchestrator
 
-# Helper class to handle MongoDB's default _id field
+os.makedirs("logs", exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("logs/api.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("bse_api")
+
+
 class PyObjectId(ObjectId):
     @classmethod
-    def __get_validators__(cls):
-        yield cls.validate
+    def __get_pydantic_core_schema__(cls, _source_type, handler):
+        return handler(str)
 
     @classmethod
-    def validate(cls, v):
-        if not ObjectId.is_valid(v):
-            raise ValueError("Invalid ObjectId")
-        return ObjectId(v)
+    def __get_pydantic_json_schema__(
+        cls, core_schema, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        json_schema = handler(core_schema)
+        json_schema.update(type="string")
+        return json_schema
 
-    @classmethod
-    def __modify_schema__(cls, field_schema):
-        field_schema.update(type="string")
 
 class MongoBaseModel(BaseModel):
-    # This configuration is necessary to handle MongoDB's BSON types in Pydantic
-    class Config:
-        allow_population_by_field_name = True
-        arbitrary_types_allowed = True
-        json_encoders = {ObjectId: str, datetime: lambda dt: dt.isoformat()}
+    model_config = {
+        "populate_by_name": True,
+        "arbitrary_types_allowed": True,
+        "json_encoders": {
+            ObjectId: lambda v: str(v),
+            datetime: lambda v: v.isoformat(),
+        }
+    }
+
 
 class InsightResponse(MongoBaseModel):
-    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    id: PyObjectId = Field(alias="_id")
     company: str
     date: str
-    category: str
-    metrics: dict
+    category: Optional[str] = None
+    metrics: Dict[str, Any]
 
-class PredictionResponse(MongoBaseModel):
+
+# Streamlined Ranking model for dashboard consumption
+class RankingResponse(MongoBaseModel):
+    id: PyObjectId = Field(alias="_id")
     company: str
-    predicted_change_pct: float
-    prediction_date: datetime
-    predicted_direction: str # UP/DOWN string can be derived here or in the model
+    ticker: Optional[str] = None
+    date: str
+    ranking_score: Optional[float] = None
+    
+    # Flattened Metrics (aligned with esm_pipeline.py final output)
+    quarter: Optional[str] = None
+    sentiment: Optional[float] = None # Simplified key name from sentiment_score_finbert
+    
+    revenue_current: Optional[float] = None
+    pat_current: Optional[float] = None
+    ebitda_current: Optional[float] = None
+    revenue_yoy_change: Optional[float] = None
+    
+    key_highlights: Optional[List[str]] = []
 
-# --- FastAPI App Setup ---
-app = FastAPI(title="BSE AI Analysis API")
+
+# Model for the forthcoming results calendar endpoint
+class CalendarRecord(MongoBaseModel):
+    scrip_code: str
+    company_name: str
+    TICKER: str
+    meeting_date_raw: str
+    meeting_date_standard: Optional[str] = None
+    bse_url: Optional[str] = None
+    scraped_at: datetime
+
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 DB_NAME = os.getenv("DB_NAME", "bse_data")
 
-# Connect to MongoDB
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client[DB_NAME]
+esm_calculator: Optional[ESMCalculator] = None
+orchestrator: Optional[PipelineOrchestrator] = None
+scheduler: Optional[AsyncIOScheduler] = None
+
 insights_collection = db["insights"]
-predictions_collection = db["predictions"]
+parsed_pdfs_collection = db["parsed_pdfs"]
 announcements_collection = db["announcements"]
+result_calendar_collection = db["result_calendar"] # Added result calendar collection
 
 
-# Initialize Prediction Logic (Needs to be trained before use!)
-predictor = StockPredictor()
+class LogResponseMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        logger.info(f"Request: {request.method} {request.url.path}")
+        response = await call_next(request)
+        logger.info(f"Response Status: {response.status_code} ({request.method} {request.url.path})")
+        return response
 
-@app.on_event("startup")
-def startup_db_client():
-    # Placeholder: In a production environment, you would trigger model training here.
-    # predictor.train_model_across_all_companies() 
-    print("FastAPI app started. Remember to train your model before using /predict.")
 
-# --- Endpoints ---
+def safe_float(value, default=None):
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
 
-@app.get("/")
-def read_root():
-    return {"message": "BSE AI Analysis API is running."}
 
-@app.get("/companies")
-def get_companies():
-    """Get list of all companies with insights."""
-    companies = insights_collection.distinct("company")
-    return {"companies": sorted(companies)}
-
-@app.get("/insights/{company}", response_model=List[InsightResponse])
-def get_company_insights(company: str, limit: int = 10):
-    """Get AI insights for a company."""
-    insights = list(
-        insights_collection.find({"company": company})
-        .sort("date", -1)
-        .limit(limit)
-    )
-    if not insights:
-        raise HTTPException(status_code=404, detail=f"No insights found for {company}")
-    return insights
-
-@app.get("/predictions/{company}")
-def get_prediction(company: str):
-    """Get latest stock prediction, or run one if needed."""
+def format_insight_for_ranking(doc: dict) -> dict:
+    """Formats a MongoDB insight document into the streamlined RankingResponse structure."""
     
-    # 1. Retrieve latest prediction
-    prediction = predictions_collection.find_one(
-        {"company": company},
-        sort=[("prediction_date", -1)]
-    )
-    
-    if not prediction:
-        # If no prediction exists, trigger a manual prediction run (assuming model is trained)
-        predicted_change = predictor.predict_latest(company)
-        
-        if predicted_change is None:
-            raise HTTPException(status_code=404, detail="Prediction model is not trained or no data available.")
-            
-        # Retrieve the newly created prediction
-        prediction = predictions_collection.find_one(
-            {"company": company},
-            sort=[("prediction_date", -1)]
+    # Extract flattened metrics from the 'metrics' sub-document for dashboard consumption
+    metrics = doc.get("metrics", {})
+
+    return {
+        "_id": str(doc["_id"]),
+        "company": doc.get("company"),
+        "ticker": doc.get("esm_ticker"),
+        "date": doc.get("date"),
+        "quarter": doc.get("quarter"),
+        "ranking_score": safe_float(doc.get("ranking_score")),
+        # Simplified sentiment key
+        "sentiment": safe_float(doc.get("sentiment_score")),
+        # Flattened metrics
+        "revenue_current": safe_float(metrics.get("revenue_current_qtr")),
+        "pat_current": safe_float(metrics.get("pat_current_qtr")),
+        "ebitda_current": safe_float(metrics.get("ebitda_current_qtr")),
+        "revenue_yoy_change": safe_float(metrics.get("revenue_yoy_change_pct")),
+        "key_highlights": metrics.get("key_highlights", [])
+    }
+
+
+async def daily_pipeline_job():
+    global orchestrator
+    if not orchestrator:
+        logger.error("Scheduler failed: Pipeline Orchestrator is not initialized.")
+        return
+    try:
+        results = await orchestrator.run_full_pipeline(days_ago=1, limit=50)
+        return results
+    except Exception as e:
+        logger.error(f"Daily pipeline failed: {e}", exc_info=True)
+
+async def esm_daily_job():
+    global orchestrator
+    if not orchestrator:
+        logger.error("ESM pipeline skipped: orchestrator not initialized")
+        return
+
+    # Check if today's ESM data already exists (checking for any insight)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    existing = insights_collection.count_documents({"date": today_str})
+    if existing > 0:
+        logger.info(f"ESM data for {today_str} already exists. Skipping pipeline.")
+        return
+
+    try:
+        logger.info(f"Running ESM pipeline for {today_str}")
+        await orchestrator.run_esm_pipeline(days_ago=0)
+        logger.info("ESM pipeline completed successfully")
+    except Exception as e:
+        logger.error(f"ESM pipeline failed: {e}", exc_info=True)
+
+
+async def lifespan(app: FastAPI):
+    global esm_calculator, orchestrator, scheduler
+
+    try:
+        esm_calculator = ESMCalculator()
+        orchestrator = PipelineOrchestrator(MONGO_URI, DB_NAME)
+        logger.info("ESM Calculator and Pipeline Orchestrator initialized")
+    except Exception:
+        yield
+        return
+
+    try:
+        scheduler = AsyncIOScheduler()
+
+        scheduler.add_job(
+            esm_daily_job,
+            "cron",
+            day_of_week="mon-fri",
+            hour=15,
+            minute=30,
+            id="esm_daily_job"
         )
 
-    # Convert BSON types for API response
-    prediction['id'] = str(prediction.pop('_id'))
-    prediction['predicted_direction'] = "UP" if prediction['predicted_change_pct'] > 0 else "DOWN"
-    prediction['confidence'] = abs(prediction['predicted_change_pct']) # Simple confidence proxy
-    
-    return prediction
+        scheduler.add_job(
+            daily_pipeline_job,
+            "cron",
+            day_of_week="mon-fri",
+            hour="*",
+            minute=0,
+            id="weekday_hourly_pipeline"
+        )
 
-@app.get("/dashboard/summary")
-def get_dashboard_summary():
-    """Get dashboard summary data."""
+        scheduler.start()
+        logger.info("APScheduler started with weekday hourly cron.")
+    except Exception as e:
+        logger.error(f"Scheduler setup failed: {e}")
+
+
+    try:
+        logger.info("Running startup pipeline (7 days).")
+        await orchestrator.run_full_pipeline(days_ago=7, limit=50)
+        logger.info("Startup pipeline completed.")
+    except Exception as e:
+        logger.error(f"Startup pipeline failed: {e}", exc_info=True)
+
+    yield
+
+    if scheduler:
+        scheduler.shutdown()
+        logger.info("APScheduler shut down.")
+    if mongo_client:
+        mongo_client.close()
+        logger.info("MongoDB connection closed.")
+
+
+app = FastAPI(
+    title="BSE Insights API",
+    lifespan=lifespan
+)
+app.add_middleware(LogResponseMiddleware)
+
+
+@app.get("/insights", response_model=List[InsightResponse])
+def get_insights(limit: int = 20):
+    docs = insights_collection.find().sort("analyzed_at", -1).limit(limit)
+    return list(docs)
+
+
+@app.get("/rankings", response_model=Dict[str, List[RankingResponse]])
+def get_rankings(
+    start_date: str = Query((datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")),
+    end_date: str = Query(datetime.now().strftime("%Y-%m-%d"))
+):
+    query = {
+        "date": {"$gte": start_date, "$lte": end_date},
+        "ranking_score": {"$exists": True, "$ne": None}
+    }
+    ranked_docs = list(insights_collection.find(query).sort("ranking_score", -1))
+    if not ranked_docs:
+        return {"rankings": []}
+        
+    # Apply ranking logic (sorting and adding 'rank' field) is now done in the backend pipeline 
+    # (or in the Streamlit app). Here we ensure the data structure is correct.
+    rankings = [format_insight_for_ranking(doc) for doc in ranked_docs]
+    return {"rankings": rankings}
+
+
+@app.get("/rankings/summary")
+def get_ranking_summary(
+    start_date: str = Query((datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")),
+    end_date: str = Query(datetime.now().strftime("%Y-%m-%d"))
+):
+    query = {
+        "date": {"$gte": start_date, "$lte": end_date},
+        "ranking_score": {"$exists": True, "$ne": None}
+    }
+    pipeline = [
+        {"$match": query},
+        {"$group": {
+            "_id": None,
+            "total_ranked": {"$sum": 1},
+            "avg_ranking_score": {"$avg": "$ranking_score"},
+            "max_ranking_score": {"$max": "$ranking_score"},
+            "min_ranking_score": {"$min": "$ranking_score"},
+            "total_positive_signals": {"$sum": {"$cond": [{"$gt": ["$ranking_score", 0]}, 1, 0]}}
+        }}
+    ]
+    summary = list(insights_collection.aggregate(pipeline))
+    if not summary:
+        return {
+            "total_ranked": 0,
+            "avg_ranking_score": 0.0,
+            "max_ranking_score": 0.0,
+            "min_ranking_score": 0.0,
+            "total_positive_signals": 0
+        }
+    return summary[0]
+
+
+@app.get("/calendar", response_model=Dict[str, List[CalendarRecord]])
+def get_forthcoming_results():
+    """Retrieves forthcoming results (today or future) from the calendar collection."""
+    today_str = datetime.now().strftime("%Y-%m-%d")
     
-    total_announcements = announcements_collection.count_documents({})
-    total_insights = insights_collection.count_documents({})
+    query = {
+        "meeting_date_standard": {"$gte": today_str},
+        "TICKER": {"$ne": None} # Ensure we only return records with a ticker
+    }
     
-    # Top predicted movers
-    top_predictions = list(
-        predictions_collection.find()
-        .sort("predicted_change_pct", -1)
-        .limit(10)
-    )
+    # Fetch and sort by meeting date
+    docs = list(result_calendar_collection.find(query).sort("meeting_date_standard", 1))
     
+    # Manual data preparation is minimal due to CalendarRecord model alignment
+    return {"calendar": docs}
+
+
+@app.post("/pipeline/run")
+async def run_full_pipeline_endpoint(
+    days_ago: int = Query(7),
+    limit: int = Query(50)
+):
+    if not orchestrator:
+        raise HTTPException(503, "Pipeline orchestrator not initialized.")
+    try:
+        results = await orchestrator.run_full_pipeline(days_ago=days_ago, limit=limit)
+        return {"status": "Pipeline run complete", "details": results}
+    except Exception as e:
+        logger.error(f"Error running pipeline: {e}", exc_info=True)
+        raise HTTPException(500, f"Pipeline execution failed: {str(e)}")
+
+@app.get("/pipeline/stats")
+def get_pipeline_stats():
     return {
-        "stats": {
-            "total_announcements": total_announcements,
-            "insights_generated": total_insights,
-        },
-        "top_predictions": top_predictions
+        "announcements_count": announcements_collection.count_documents({}),
+        "parsed_pdfs_count": parsed_pdfs_collection.count_documents({}),
+        "insights_count": insights_collection.count_documents({}),
+        "insights_with_ranking_score": insights_collection.count_documents({"ranking_score": {"$exists": True, "$ne": None}}),
+        "calendar_count": result_calendar_collection.count_documents({})
     }

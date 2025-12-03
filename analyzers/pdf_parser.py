@@ -6,7 +6,7 @@ from pymongo import MongoClient
 from bson.objectid import ObjectId
 import logging
 import re
-import fitz
+import pymupdf
 import pytesseract
 import cv2
 import numpy as np
@@ -15,7 +15,6 @@ import io
 import hashlib
 
 logger = logging.getLogger("pdf_processor")
-
 
 class TextPreProcessor:
     def __init__(self, raw_text: str):
@@ -47,15 +46,12 @@ class TextPreProcessor:
         self.text = self.text.replace("||P||", "\n\n")
         self.text = re.sub(r"\s{2,}", " ", self.text).strip()
 
-
 class PDFProcessor:
     def __init__(self, mongo_uri="mongodb://localhost:27017/", db_name="bse_data"):
         self.client = MongoClient(mongo_uri)
         self.db = self.client[db_name]
-
         self.ann = self.db["announcements"]
         self.parsed = self.db["parsed_pdfs"]
-
         self.parsed.create_index("pdf_hash", unique=True)
         self.parsed.create_index("announcement_id")
 
@@ -63,9 +59,8 @@ class PDFProcessor:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "Accept": "*/*",
-            "Referer": "https://www.nseindia.com/",
+            "Referer": "https://www.bseindia.com/",
         }
-
         for attempt in range(3):
             try:
                 with httpx.Client(headers=headers, timeout=60, http2=False) as client:
@@ -75,9 +70,7 @@ class PDFProcessor:
             except Exception as e:
                 logger.error(f"download failed {url} attempt {attempt+1}: {e}")
                 time.sleep(2)
-
         return None
-
 
     def _preprocess_image(self, image):
         gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
@@ -85,20 +78,27 @@ class PDFProcessor:
         _, th = cv2.threshold(den, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         return Image.fromarray(th)
 
-    def _extract_ocr(self, pdf_bytes):
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        out = ""
+    def _is_table(self, text):
+        lines = text.split("\n")
+        for line in lines:
+            numbers = sum(1 for w in line.split() if any(c.isdigit() for c in w))
+            if numbers >= 3:
+                return True
+        return False
+
+    def _extract_text_or_ocr(self, pdf_bytes):
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        full_text = ""
         for i, page in enumerate(doc):
-            try:
+            text = page.get_text()
+            if not text.strip() or self._is_table(text):
                 pix = page.get_pixmap(dpi=300)
                 img = Image.open(io.BytesIO(pix.tobytes("png")))
                 proc = self._preprocess_image(img)
-                t = pytesseract.image_to_string(proc, lang="eng")
-                out += f"\n--- Page {i+1} ---\n{t}"
-            except Exception as e:
-                logger.error(f"ocr failed page {i+1}: {e}")
+                text = pytesseract.image_to_string(proc, lang="eng")
+            full_text += f"\n--- Page {i+1} ---\n{text}"
         doc.close()
-        return out
+        return full_text
 
     def _consolidate(self, txt):
         return txt.strip()
@@ -108,33 +108,24 @@ class PDFProcessor:
             ann = self.ann.find_one({"_id": ObjectId(ann_id)})
             if not ann:
                 return {"status": "failed", "reason": "not found"}
-
             pdf = self._download(url)
             if not pdf:
                 return {"status": "failed", "reason": "download"}
-
             h = hashlib.md5(pdf).hexdigest()
             existing = self.parsed.find_one({"pdf_hash": h})
             if existing:
-                self.parsed.update_one(
-                    {"_id": existing["_id"]},
-                    {"$addToSet": {"announcement_ids": ann_id}},
-                )
+                self.parsed.update_one({"_id": existing["_id"]}, {"$addToSet": {"announcement_ids": ann_id}})
                 return {"status": "success", "id": str(existing["_id"]), "method": "cached"}
-
-            raw = self._extract_ocr(pdf)
+            raw = self._extract_text_or_ocr(pdf)
             if not raw.strip():
                 return {"status": "failed", "reason": "empty"}
-
             cleaner = TextPreProcessor(raw)
             cleaned = cleaner.run()
             final = self._consolidate(cleaned)
-
             try:
                 d = datetime.strptime(ann.get("date", ""), "%Y-%m-%d")
             except:
                 d = None
-
             doc = {
                 "announcement_ids": [ann_id],
                 "pdf_url": url,
@@ -148,37 +139,22 @@ class PDFProcessor:
                 "announcement_title": ann.get("title"),
                 "category": ann.get("category"),
             }
-
             res = self.parsed.insert_one(doc)
-            self.ann.update_one(
-                {"_id": ObjectId(ann_id)},
-                {"$set": {"pdf_text_id": str(res.inserted_id), "pdf_processed_status": "SUCCESS"}},
-            )
-
+            self.ann.update_one({"_id": ObjectId(ann_id)}, {"$set": {"pdf_text_id": str(res.inserted_id), "pdf_processed_status": "SUCCESS"}})
             return {"status": "success", "id": str(res.inserted_id)}
-
         except Exception as e:
             logger.error(f"process error {url}: {e}")
             return {"status": "failed", "reason": str(e)}
 
-    def process_batch(self, limit=10):
+    def process_batch(self, limit=50):
         out = []
-        q = self.ann.find({
-            "pdf_url": {"$exists": True, "$ne": None, "$ne": ""},
-            "pdf_text_id": {"$exists": False}
-        }).limit(limit)
-
+        q = self.ann.find({"pdf_url": {"$exists": True, "$ne": None, "$ne": ""}, "pdf_text_id": {"$exists": False}}).limit(limit)
         c = 0
         for ann in q:
             r = self.process_pdf(str(ann["_id"]), ann["pdf_url"])
             if r.get("status") == "success":
                 c += 1
-            out.append({
-                "announcement_id": str(ann["_id"]),
-                "company": ann.get("company"),
-                "result": r
-            })
+            out.append({"announcement_id": str(ann["_id"]), "company": ann.get("company"), "result": r})
             if c >= limit:
                 break
-
         return out

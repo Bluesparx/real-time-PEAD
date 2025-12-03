@@ -1,165 +1,324 @@
-# dashboard.py
-
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
 import plotly.express as px
-from pymongo import MongoClient
+import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import requests
-from typing import Optional
+from typing import Optional, Dict, List, Any
 
-# Page config
+# --- CONFIGURATION ---
 st.set_page_config(
-    page_title="BSE AI Analysis Dashboard",
-    page_icon="📈",
-    layout="wide"
+    page_title="Qualitative Event Ranking Dashboard",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# --- Configuration ---
+# Replace with your actual API URL
 API_URL = "http://localhost:8000"
 
-# Title
-st.title("📈 BSE Real-Time AI Analysis Dashboard")
-st.markdown("---")
+# --- ENHANCED CSS ---
+st.markdown("""
+    <style>
+    .stMetric {
+        background-color: #e0e0e0 ;
+        padding: 15px;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 24px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        padding: 10px 20px;
+    }
+    div[data-testid="stExpander"] {
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        margin-bottom: 10px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-# --- Helper Functions ---
+st.title("Qualitative Event Ranking Dashboard")
+st.caption("Qualitative Analysis and Ranking for Earnings Events (Fundamentals + Sentiment + Price Reaction)")
 
-# Function to fetch data from the FastAPI backend
-def fetch_api_data(endpoint: str, company: Optional[str] = None):
+# --- API HELPER ---
+def fetch_api_data(endpoint: str, params: Optional[Dict] = None):
     try:
         url = f"{API_URL}{endpoint}"
-        if company:
-            url += f"/{company}"
-        response = requests.get(url)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error connecting to API ({endpoint}): {e}")
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        st.error(f"API Error at {endpoint}: {e}. Ensure the FastAPI server is running at {API_URL}.")
         return None
+
+# --- SIDEBAR FILTERS (Simplified) ---
+with st.sidebar:
+    st.header("Filters")
     
-# --- Sidebar ---
-st.sidebar.header("Filters")
-
-# Get companies
-companies_data = fetch_api_data("/companies")
-companies = companies_data.get("companies", []) if companies_data else []
-
-selected_company = st.sidebar.selectbox("Select Company", ["All"] + companies)
-
-date_range = st.sidebar.date_input(
-    "Analysis Window",
-    value=(datetime.now() - timedelta(days=90), datetime.now())
-)
-
-# Refresh data
-if st.sidebar.button("🔄 Refresh Data"):
-    st.cache_data.clear()
-    st.rerun()
-
-st.sidebar.markdown("---")
-st.sidebar.header("Agent Status")
-
-# --- Main Dashboard ---
-
-# 1. KPI Cards (Stats fetched from /dashboard/summary)
-summary_data = fetch_api_data("/dashboard/summary")
-
-if summary_data:
-    stats = summary_data.get("stats", {})
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric("Total Announcements", f"{stats.get('total_announcements', 0):,}")
-    col2.metric("PDFs Processed", f"{stats.get('pdfs_processed', 0):,}")
-    col3.metric("Insights Generated", f"{stats.get('insights_generated', 0):,}")
-    col4.metric("Predictions Made", f"{stats.get('predictions_made', 0):,}")
+    today = datetime.now().date()
     
-st.markdown("---")
-
-# 2. Company-Specific Analysis (Prediction + Insights)
-if selected_company != "All":
-    st.header(f"Company Profile: {selected_company}")
-
-    # --- Prediction ---
-    prediction_data = fetch_api_data("/predictions", company=selected_company)
+    # 1. Time Period
+    st.subheader("Time Period")
+    time_period = st.selectbox(
+        "Date Range",
+        ["Last 3 Days", "Last 7 Days", "Last 30 Days"],
+        index=1
+    )
     
-    if prediction_data:
-        pred_col1, pred_col2, pred_col3 = st.columns([1, 1, 2])
-        
-        pred_col1.subheader("Prediction")
-        pred_col1.metric(
-            "7-Day Change", 
-            f"{prediction_data.get('predicted_change_pct', 0):.2f}%",
-            delta=prediction_data.get('predicted_direction', '')
-        )
-        pred_col2.metric("Confidence Score", f"{prediction_data.get('confidence', 0):.2f}")
-        pred_col3.info(
-            f"**Analysis Date:** {prediction_data.get('prediction_date').split('T')[0]}"
-        )
+    if time_period == "Last 3 Days":
+        start_date = today - timedelta(days=3)
+    elif time_period == "Last 30 Days":
+        start_date = today - timedelta(days=30)
+    else: # Default: Last 7 Days
+        start_date = today - timedelta(days=7)
+    end_date = today
+    
+    st.divider()
+    
+    # 2. Trading Signals (Simplified multiselect)
+    st.subheader("Trading Signal")
+    signal_filter = st.multiselect(
+        "Include Signals",
+        ["Strong Buy", "Buy", "Hold", "Sell", "Strong Sell"],
+        default=["Strong Buy", "Buy"] # Focus on opportunities
+    )
+    
+    st.divider()
+    
+    # Refresh button
+    if st.button("Refresh Data", width='stretch'):
+        st.cache_data.clear()
+        st.rerun()
+    
+    st.caption("Data is currently filtered from {} to {}.".format(start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")))
+
+# --- HELPER FUNCTIONS ---
+def get_trading_signal(row):
+    """Trading signal logic based ONLY on the single ranking_score."""
+    ranking_score = row.get('ranking_score', 0)
+    
+    if ranking_score > 0.4:
+        # High ranking score indicates strong qualitative assessment and positive price reaction
+        return "Strong Buy", "Strong Buy", "#00c853"
+    elif ranking_score > 0.1:
+        return "Buy", "Buy", "#ffd600"
+    elif ranking_score < -0.1:
+        return "Sell", "Sell", "#ff5252"
+    elif ranking_score < -0.4:
+        return "Strong Sell", "Strong Sell", "#424242"
     else:
-        st.warning(f"No predictions available for {selected_company}.")
-    
-    st.markdown("---")
+        return "Hold", "Hold", "#9e9e9e"
 
-    # --- Insights History ---
-    st.subheader("Historical AI Insights")
-    insights_list = fetch_api_data("/insights", company=selected_company)
-    
-    if insights_list:
-        # Convert to DataFrame for display and plotting
-        insights_df = pd.DataFrame(insights_list)
-        
-        # 2a. Sentiment Over Time (Using Plotly)
-        sentiment_scores = insights_df['metrics'].apply(
-            lambda x: 1 if x.get('sentiment') == 'positive' else (-1 if x.get('sentiment') == 'negative' else 0)
-        )
-        
-        fig = px.bar(
-            x=insights_df['date'], 
-            y=sentiment_scores, 
-            title="Sentiment Trend of Announcements",
-            labels={'x': 'Date', 'y': 'Sentiment Score (-1 to 1)'}
-        )
-        st.plotly_chart(fig, use_container_width=True)
+def get_sentiment_label(score):
+    if score is None:
+        return "Neutral"
+    if score > 0.3:
+        return "Positive"
+    elif score < -0.3:
+        return "Negative"
+    return "Neutral"
 
-        # 2b. Detailed Metrics Table
-        st.markdown("#### Key Financial Metrics Extracted by LLM")
-        
-        # Flatten metrics for table view
-        metrics_flat = insights_df.apply(
-            lambda row: {
-                'Date': row['date'],
-                'Revenue (M)': row['metrics'].get('revenue'),
-                'Profit (M)': row['metrics'].get('profit'),
-                'Sentiment': row['metrics'].get('sentiment'),
-                'Key Highlights': ', '.join(row['metrics'].get('key_highlights', []))[:80] + '...'
-            }, axis=1
-        )
-        st.dataframe(metrics_flat, use_container_width=True)
-        
-else:
-    # 3. Global Summary (If 'All' is selected)
-    st.header("Global Market Overview")
+def format_currency(value):
+    if value is None or pd.isna(value):
+        return "N/A"
+    if value >= 10000000:  # Crores
+        return f"₹{value/10000000:.2f}Cr"
+    elif value >= 100000:  # Lakhs
+        return f"₹{value/100000:.2f}L"
+    return f"₹{value:.2f}"
+
+def format_percentage(value):
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{value:.2f}%"
+
+# --- DATA FETCHERS ---
+@st.cache_data(ttl=300)
+def get_rankings_data(start_date, end_date):
+    params = {
+        "start_date": start_date.strftime("%Y-%m-%d"),
+        "end_date": end_date.strftime("%Y-%m-%d")
+    }
+    return fetch_api_data("/rankings", params=params)
+
+@st.cache_data(ttl=3600)
+def get_calendar_data():
+    """Fetches the forthcoming results calendar data."""
+    calendar_response = fetch_api_data("/calendar") 
+    return calendar_response.get('calendar', []) if calendar_response else []
+
+
+# --- MAIN DATA LOADING ---
+with st.spinner("Loading rankings data..."):
+    rankings_data = get_rankings_data(start_date, end_date)
+
+# --- RANKINGS PROCESSING AND FILTERING ---
+if rankings_data and rankings_data.get('rankings'):
+    df = pd.DataFrame(rankings_data['rankings'])
     
-    if summary_data:
-        # Top Predictions Table
-        st.subheader("Top Predicted Stock Moves")
-        top_predictions_df = pd.DataFrame(summary_data.get("top_predictions", []))
-        if not top_predictions_df.empty:
+    # --- DATA PROCESSING ---
+    df['signal'], df['signal_label'], df['signal_color'] = zip(*df.apply(get_trading_signal, axis=1))
+    df['sentiment_label'] = df['sentiment'].apply(get_sentiment_label)
+    
+    # Robust date parsing
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    
+    # Handle NaN values for columns used in Plotly 'size' argument
+    if 'revenue_current' in df.columns:
+        median_rev = df['revenue_current'].median() if df['revenue_current'].notna().any() else 1
+        df['revenue_current_plot'] = df['revenue_current'].fillna(median_rev)
+    else:
+        df['revenue_current_plot'] = 1 
+    
+    # Apply filters 
+    filtered_df = df[
+        (df['signal'].isin(signal_filter)) 
+    ].copy()
+    
+    # Apply implicit revenue growth filter (can be adjusted/removed)
+    if 'revenue_yoy_change' in filtered_df.columns:
+        min_revenue_growth = -20.0 
+        filtered_df = filtered_df[
+            (filtered_df['revenue_yoy_change'].isna()) | 
+            (filtered_df['revenue_yoy_change'] >= min_revenue_growth)
+        ]
+    
+    # Final sorting based on the ranking score
+    filtered_df = filtered_df.sort_values('ranking_score', ascending=False)
+    
+    # ADDED: Calculate rank on the frontend after final sorting
+    filtered_df['rank'] = range(1, len(filtered_df) + 1) 
+    
+    # --- KEY METRICS ---
+    st.divider()
+    
+    # --- MAIN CONTENT TABS ---
+    tab1, tab2, tab3 = st.tabs(["Top Rankings", "Deep Dive", "Results Calendar"])
+    
+    with tab1:
+        st.subheader(f"Top {len(filtered_df)} Ranked Events")
+        
+        # Prepare clean table
+        display_df = filtered_df.head(20).copy()
+        
+        table_data = []
+        for _, row in display_df.iterrows():
+            table_data.append({
+                'Rank': row['rank'], # Now safely accessible
+                'Signal': row['signal'],
+                'Company': row['company'],
+                'Ticker': row.get('ticker', 'N/A'),
+                'Date': row['date'].strftime('%d-%b'),
+                'Ranking Score': f"{row['ranking_score']:.4f}",
+                'Sentiment': row['sentiment_label'],
+                'Revenue': format_currency(row.get('revenue_current')),
+                'Rev YoY': format_percentage(row.get('revenue_yoy_change')),
+            })
+        
+        st.dataframe(
+            pd.DataFrame(table_data),
+            width='stretch',
+            hide_index=True,
+            height=500
+        )
+        
+        # Download button
+        csv = filtered_df.to_csv(index=False)
+        st.download_button(
+            label="Download Full Data (CSV)",
+            data=csv,
+            file_name=f"event_rankings_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
+    
+    with tab2:
+        st.subheader("Detailed Company Analysis")
+        
+        # Company selector
+        selected_company = st.selectbox(
+            "Select a company for detailed analysis",
+            filtered_df['company'].unique()
+        )
+        
+        if selected_company:
+            company_data = filtered_df[filtered_df['company'] == selected_company].iloc[0]
+            
+            # Overview
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Signal", company_data['signal'])
+            with col2:
+                st.metric("Ranking Score", f"{company_data['ranking_score']:.4f}")
+            with col3:
+                st.metric("Sentiment Score", f"{company_data.get('sentiment', 0):.3f}")
+            
+            st.divider()
+            
+            # Financials
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("### Financial Metrics")
+                st.write(f"**Quarter:** {company_data.get('quarter', 'N/A')}")
+                st.write(f"**Date:** {company_data['date'].strftime('%Y-%m-%d')}")
+                st.write(f"**Revenue:** {format_currency(company_data.get('revenue_current'))}")
+                st.write(f"**PAT:** {format_currency(company_data.get('pat_current'))}")
+                st.write(f"**EBITDA:** {format_currency(company_data.get('ebitda_current'))}")
+            
+            with col2:
+                st.markdown("### Growth & Ranking")
+                st.write(f"**Rank:** {company_data['rank']}") # Now safely accessible
+                st.write(f"**Rev YoY Change:** {format_percentage(company_data.get('revenue_yoy_change'))}")
+                st.write(f"**Sentiment:** {company_data['sentiment_label']}")
+            
+            # Key highlights
+            if company_data.get('key_highlights'):
+                st.markdown("### Key Highlights")
+                for highlight in company_data['key_highlights']:
+                    st.markdown(f"* {highlight}")
+        else:
+            st.info("No company selected for detailed analysis.")
+            
+    with tab3:
+        st.subheader("Forthcoming Results Calendar (Next 30 Days)")
+        
+        with st.spinner("Fetching calendar data..."):
+            calendar_records = get_calendar_data()
+        
+        if calendar_records:
+            cal_df = pd.DataFrame(calendar_records)
+            
+            # Select and rename columns for display
+            display_cal_df = cal_df.rename(columns={
+                'company_name': 'Company Name',
+                'TICKER': 'Ticker',
+                'meeting_date_standard': 'Meeting Date',
+                'meeting_date_raw': 'Raw Date',
+                'scrip_code': 'Scrip Code',
+            })[['Company Name', 'Ticker', 'Meeting Date', 'Raw Date', 'Scrip Code']]
+            
+            # Format date for better sorting/display
+            display_cal_df['Meeting Date'] = pd.to_datetime(display_cal_df['Meeting Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+            display_cal_df = display_cal_df.sort_values(by='Meeting Date', ascending=True)
+
             st.dataframe(
-                top_predictions_df[['company', 'predicted_change_pct', 'predicted_direction', 'confidence']],
-                use_container_width=True
+                display_cal_df,
+                width='stretch',
+                hide_index=True,
+                height=600
             )
+            
+            st.caption("Data scraped from BSE India, showing forthcoming results scheduled in the next 30 days.")
         else:
-            st.info("No sufficient data to generate top predictions yet.")
-        
-        # Positive News Feed
-        st.subheader("Latest Positive News (LLM Classified)")
-        positive_df = pd.DataFrame(summary_data.get("positive_news", []))
-        if not positive_df.empty:
-            positive_df['title'] = positive_df['metrics'].apply(
-                lambda x: x.get('key_highlights', [''])[0]
-            )
-            st.dataframe(positive_df[['date', 'company', 'category', 'title']], use_container_width=True)
-        else:
-            st.info("No recent positive news classified by the LLM.")
+            st.warning("Could not retrieve forthcoming results calendar. Ensure your backend API is running and exposes the `/calendar` endpoint.")
+
+
+else:
+    # If rankings_data is None (API failure) or rankings_data['rankings'] is empty (DB empty/query failed)
+    st.warning(f"No ranking data available for the selected period from the API ({API_URL}/rankings).")
+
+# Footer
+st.divider()
+st.caption("This dashboard is for informational purposes only. Not financial advice.")

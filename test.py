@@ -1,9 +1,7 @@
-from pdf_parser import PDFProcessor
+from analyzers.llm_analyzer import LLMAnalyzer
 
-processor = PDFProcessor()
+# Initialize the analyzer
+analyzer = LLMAnalyzer(mongo_uri="mongodb://localhost:27017/", db_name="bse_data")
 
-ann_id = "692abdca9b7c7a46f08fbc25"
-pdf_url = "https://nsearchives.nseindia.com/corporate/SELetter_signed_11012024155319.pdf"
-
-result = processor.process_pdf(ann_id, pdf_url)
-print(result)
+result = analyzer.analyze_unanalyzed_pdfs(10)
+print("Analysis Result:", result)

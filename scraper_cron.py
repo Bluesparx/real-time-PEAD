@@ -8,6 +8,7 @@ from playwright.async_api import async_playwright
 from pymongo import MongoClient, UpdateOne
 from pymongo.errors import BulkWriteError
 import logging
+import sys
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,6 +20,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 # --- Config ---
 API_URL = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
 ANN_PER_PAGE = 50
@@ -27,7 +31,7 @@ TIMEOUT_SECONDS = 60
 BATCH_SIZE = 100 
 
 
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = os.getenv("DB_NAME", "bse_data")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "announcements")
 
@@ -312,7 +316,7 @@ if __name__ == "__main__":
     import sys
     
     # Example 1: python scraper_cron.py today
-    # Example 2: python scraper_cron.py 2025-06-01 2025-9-30
+    # Example 2: python scraper_cron.py 2025-11-01 2025-11-30
     
     if len(sys.argv) > 1 and sys.argv[1] == "today":
         asyncio.run(scrape_today())
