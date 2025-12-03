@@ -139,9 +139,7 @@ def format_insight_for_ranking(doc: dict) -> dict:
         "date": doc.get("date"),
         "quarter": doc.get("quarter"),
         "ranking_score": safe_float(doc.get("ranking_score")),
-        # Simplified sentiment key
         "sentiment": safe_float(doc.get("sentiment_score")),
-        # Flattened metrics
         "revenue_current": safe_float(metrics.get("revenue_current_qtr")),
         "pat_current": safe_float(metrics.get("pat_current_qtr")),
         "ebitda_current": safe_float(metrics.get("ebitda_current_qtr")),

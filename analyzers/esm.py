@@ -174,7 +174,7 @@ class ESMCalculator:
         self.market_col = self.db[PRICE_COLLECTION] 
         self.ticker_map = self._load_ticker_map()
         self.GEMINI_MODEL = "gemini-2.5-flash" 
-        self.gemini_client = genai.Client(api_key="AIzaSyBSUGneVbZruEhpXWkaOPwIzv_QjOzjMWs")
+        self.gemini_client = genai.Client(api_key="api")
         self._price_cache: Dict[str, pd.DataFrame] = {}
 
     def _clean_company_name(self, company_name: str) -> str:
