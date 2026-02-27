@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import asyncio
 
 from analyzers.llm_analyzer import LLMAnalyzer
-from analyzers.esm import run_esm_bulk_analysis, run_esm_daily_update, esm_already_exists_for_today
+from analyzers.esm import run_esm_bulk_analysis, esm_already_exists_for_today
 from scraper_cron import scrape_all
 
 logger = logging.getLogger("pipeline_orchestrator")
@@ -75,7 +75,7 @@ class PipelineOrchestrator:
         llm_results = await self.run_llm_pipeline(limit=limit)
         logger.info(f"LLM analysis complete: {len(llm_results)} PDFs processed")
 
-        # # Step 3: Daily stock update
+        # Step 3: Daily stock update
         # try:
         #     run_esm_daily_update(datetime.now().strftime("%Y-%m-%d"))
         #     logger.info("Stock prices updated successfully")

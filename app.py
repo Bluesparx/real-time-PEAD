@@ -13,7 +13,6 @@ import asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import time
 
-# NOTE: Assuming these are available in the API environment
 from analyzers.esm import ESMCalculator 
 from pipeline_orchestrator import PipelineOrchestrator
 
@@ -54,7 +53,6 @@ class MongoBaseModel(BaseModel):
         }
     }
 
-
 class InsightResponse(MongoBaseModel):
     id: PyObjectId = Field(alias="_id")
     company: str
@@ -87,7 +85,7 @@ class RankingResponse(MongoBaseModel):
 class CalendarRecord(MongoBaseModel):
     scrip_code: str
     company_name: str
-    TICKER: str
+    short_name: str
     meeting_date_raw: str
     meeting_date_standard: Optional[str] = None
     bse_url: Optional[str] = None
@@ -106,7 +104,9 @@ scheduler: Optional[AsyncIOScheduler] = None
 insights_collection = db["insights"]
 parsed_pdfs_collection = db["parsed_pdfs"]
 announcements_collection = db["announcements"]
-result_calendar_collection = db["result_calendar"] # Added result calendar collection
+result_calendar_collection = db["result_calendar"]
+
+rankings_collection = db["rankings"] 
 
 
 class LogResponseMiddleware(BaseHTTPMiddleware):
@@ -129,22 +129,18 @@ def safe_float(value, default=None):
 def format_insight_for_ranking(doc: dict) -> dict:
     """Formats a MongoDB insight document into the streamlined RankingResponse structure."""
     
-    # Extract flattened metrics from the 'metrics' sub-document for dashboard consumption
     metrics = doc.get("metrics", {})
-
+    
     return {
         "_id": str(doc["_id"]),
         "company": doc.get("company"),
-        "ticker": doc.get("esm_ticker"),
-        "date": doc.get("date"),
-        "quarter": doc.get("quarter"),
-        "ranking_score": safe_float(doc.get("ranking_score")),
-        "sentiment": safe_float(doc.get("sentiment_score")),
-        "revenue_current": safe_float(metrics.get("revenue_current_qtr")),
-        "pat_current": safe_float(metrics.get("pat_current_qtr")),
-        "ebitda_current": safe_float(metrics.get("ebitda_current_qtr")),
-        "revenue_yoy_change": safe_float(metrics.get("revenue_yoy_change_pct")),
-        "key_highlights": metrics.get("key_highlights", [])
+        "date": doc.get("date"),    
+        "revenue_current": safe_float(doc.get("revenue_current")),
+        "pat_current": safe_float(doc.get("pat_current")),
+        "ebitda_current": doc.get("ebitda_current"),
+        "revenue_yoy_change": safe_float(doc.get("revenue_yoy_change")),
+        
+        "key_highlights": doc.get("key_highlights", [])
     }
 
 
@@ -165,7 +161,7 @@ async def esm_daily_job():
         logger.error("ESM pipeline skipped: orchestrator not initialized")
         return
 
-    # Check if today's ESM data already exists (checking for any insight)
+    # Check if today's ESM data already exists 
     today_str = datetime.now().strftime("%Y-%m-%d")
     existing = insights_collection.count_documents({"date": today_str})
     if existing > 0:
@@ -257,12 +253,11 @@ def get_rankings(
         "date": {"$gte": start_date, "$lte": end_date},
         "ranking_score": {"$exists": True, "$ne": None}
     }
-    ranked_docs = list(insights_collection.find(query).sort("ranking_score", -1))
+    # MODIFIED: Querying the new rankings_collection instead of insights_collection
+    ranked_docs = list(rankings_collection.find(query).sort("ranking_score", -1))
     if not ranked_docs:
         return {"rankings": []}
         
-    # Apply ranking logic (sorting and adding 'rank' field) is now done in the backend pipeline 
-    # (or in the Streamlit app). Here we ensure the data structure is correct.
     rankings = [format_insight_for_ranking(doc) for doc in ranked_docs]
     return {"rankings": rankings}
 
@@ -284,10 +279,12 @@ def get_ranking_summary(
             "avg_ranking_score": {"$avg": "$ranking_score"},
             "max_ranking_score": {"$max": "$ranking_score"},
             "min_ranking_score": {"$min": "$ranking_score"},
+            # NOTE: We assume 'ranking_score' being > 0 is the positive signal proxy.
             "total_positive_signals": {"$sum": {"$cond": [{"$gt": ["$ranking_score", 0]}, 1, 0]}}
         }}
     ]
-    summary = list(insights_collection.aggregate(pipeline))
+    # MODIFIED: Aggregating on the new rankings_collection
+    summary = list(rankings_collection.aggregate(pipeline))
     if not summary:
         return {
             "total_ranked": 0,
@@ -298,21 +295,29 @@ def get_ranking_summary(
         }
     return summary[0]
 
-
-@app.get("/calendar", response_model=Dict[str, List[CalendarRecord]])
 def get_forthcoming_results():
     """Retrieves forthcoming results (today or future) from the calendar collection."""
     today_str = datetime.now().strftime("%Y-%m-%d")
     
     query = {
         "meeting_date_standard": {"$gte": today_str},
-        "TICKER": {"$ne": None} # Ensure we only return records with a ticker
+        "short_name": {"$ne": None} # Ensure we only return records with a ticker
     }
     
     # Fetch and sort by meeting date
     docs = list(result_calendar_collection.find(query).sort("meeting_date_standard", 1))
     
     # Manual data preparation is minimal due to CalendarRecord model alignment
+    return {"calendar": docs}
+    
+    # Fetch and sort by meeting date
+    docs = list(result_calendar_collection.find(query).sort("meeting_date_standard", 1))
+
+    # Normalize ticker key for compatibility across existing records.
+    for doc in docs:
+        if not doc.get("short_name") and doc.get("TICKER"):
+            doc["short_name"] = doc["TICKER"]
+
     return {"calendar": docs}
 
 
@@ -337,5 +342,6 @@ def get_pipeline_stats():
         "parsed_pdfs_count": parsed_pdfs_collection.count_documents({}),
         "insights_count": insights_collection.count_documents({}),
         "insights_with_ranking_score": insights_collection.count_documents({"ranking_score": {"$exists": True, "$ne": None}}),
-        "calendar_count": result_calendar_collection.count_documents({})
+        "calendar_count": result_calendar_collection.count_documents({}),
+        "rankings_count": rankings_collection.count_documents({})
     }

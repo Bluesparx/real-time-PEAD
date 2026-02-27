@@ -1,589 +1,562 @@
+#!/usr/bin/env python3
+"""
+esm_pipeline.py
+
+Full clean rewrite of your ESM pipeline (FULL CLEAN VERSION).
+- Single Gemini call for batch ranking of insights.
+- Keeps DB document structure unchanged (history under price docs,
+  insights documents preserved with `_id`).
+- Compact imports, removed unused helpers and unused metrics.
+"""
+
 import os
 import time
-import httpx
+import json
+import math
+import logging
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+
 import pandas as pd
 import numpy as np
-import statsmodels.api as sm
-from google import genai
 import yfinance as yf
 from pymongo import MongoClient, UpdateOne
 from pymongo.errors import BulkWriteError
 from bson.objectid import ObjectId
-from datetime import datetime, timedelta
-import logging
-import math
-from typing import List, Dict, Any, Optional, Tuple
-import argparse 
-import json
 
-# Logging setup
-log_date = datetime.now().strftime("%Y-%m-%d")
-log_file = f"logs/esm_pipeline_{log_date}.log"
+# NOTE: google.genai usage retained; require GOOGLE GENAI client installed & configured
+from google import genai
+
+# ---------------------------
+# Configuration & Logging
+# ---------------------------
+LOG_DIR = os.getenv("LOG_DIR", "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_DATE = datetime.now().strftime("%Y-%m-%d")
+LOG_FILE = os.path.join(LOG_DIR, f"esm_pipeline_{LOG_DATE}.log")
+
 logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_file),
-        logging.StreamHandler()
-    ]
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler(LOG_FILE, mode="a"), logging.StreamHandler()],
 )
-logger = logging.getLogger('ESM_Pipeline')
+logger = logging.getLogger("ESM_Pipeline")
 
-# Mongo / DB setup
+# Mongo config
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 DB_NAME = os.getenv("DB_NAME", "bse_data")
-PRICE_COLLECTION = "stock_prices" 
-INSIGHTS_COLLECTION = "insights" 
-TICKER_CSV_PATH = "companies.csv"
+PRICE_COLLECTION = os.getenv("PRICE_COLLECTION", "stock_prices")
+INSIGHTS_COLLECTION = os.getenv("INSIGHTS_COLLECTION", "insights")
+RANKINGS_COLLECTION = os.getenv("RANKINGS_COLLECTION", "rankings")
 
-MARKET_TICKER = 'BSE-200.BO' 
-ESTIMATION_WINDOW = 200     
-EVENT_WINDOW_DAYS = 7
+# Other defaults
+TICKER_CSV_PATH = os.getenv("TICKER_CSV_PATH", "companies.csv")
+MARKET_TICKER = os.getenv("MARKET_TICKER", "BSE-200.BO")
+ESTIMATION_WINDOW = int(os.getenv("ESTIMATION_WINDOW", "200"))
+EVENT_WINDOW_DAYS = int(os.getenv("EVENT_WINDOW_DAYS", "7"))
 
-def get_mongo_client():
+# Gemini / GenAI client
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyA5dlO-h-uv5XBEuRpzBXj1l8qOzp9oyow")
+if not GEMINI_API_KEY:
+    logger.warning("GEMINI_API_KEY not set in environment. Set GEMINI_API_KEY before running.")
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+
+# ---------------------------
+# Utilities
+# ---------------------------
+def get_mongo_client() -> MongoClient:
+    client = MongoClient(MONGO_URI)
     try:
-        client = MongoClient(MONGO_URI)
-        client.admin.command('ping')
-        return client
+        client.admin.command("ping")
     except Exception as e:
-        logger.error(f"Failed to connect to MongoDB: {e}")
+        logger.error(f"MongoDB ping failed: {e}")
         raise
+    return client
+
 
 def date_to_string(dt: datetime) -> str:
-    return dt.strftime('%Y-%m-%d')
+    return dt.strftime("%Y-%m-%d")
 
 
+# ---------------------------
+# Stock Price Manager
+# ---------------------------
 class StockPriceManager:
-    def __init__(self, mongo_uri="mongodb://localhost:27017/", db_name="bse_data"):
+    def __init__(self, mongo_uri: str = MONGO_URI, db_name: str = DB_NAME):
         self.client = MongoClient(mongo_uri)
         self.db = self.client[db_name]
-        self.col = self.db["stock_prices"]
+        self.col = self.db[PRICE_COLLECTION]
 
-    def _normalize_ticker(self, ticker):
-        return f"{ticker}"
+    @staticmethod
+    def _normalize_ticker(ticker: str) -> str:
+        return ticker.strip()
 
-    def _fetch_prices(self, yahoo_ticker, start_date, end_date):
-        df = yf.download(yahoo_ticker, start=start_date, end=end_date, progress=False)
+    def _fetch_prices_yfinance(self, yahoo_ticker: str, start_date: datetime, end_date: datetime) -> List[Dict[str, Any]]:
+        """Download via yfinance and transform to list of {date, close, volume} dicts."""
+        try:
+            df = yf.download(yahoo_ticker, start=start_date, end=end_date + timedelta(days=1), progress=False)
+        except Exception as e:
+            logger.error(f"yfinance download failed for {yahoo_ticker}: {e}")
+            return []
+
         if df.empty:
             return []
-        
+
+        # Flatten columns if MultiIndex
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        
+
         df = df.reset_index()
         rows = []
         for _, r in df.iterrows():
-            date_val = r["Date"]
-            if isinstance(date_val, pd.Timestamp):
-                date_str = date_val.strftime("%Y-%m-%d")
-            elif hasattr(date_val, 'strftime'):
-                date_str = date_val.strftime("%Y-%m-%d")
+            date_val = r.get("Date")
+            date_str = (pd.to_datetime(date_val)).strftime("%Y-%m-%d") if date_val is not None else None
+            close_val = r.get("Close", None)
+            volume_val = r.get("Volume", None)
+            if pd.isna(close_val):
+                close = None
             else:
-                date_str = str(date_val)[:10]
-            
-            close_val = r["Close"]
-            volume_val = r["Volume"]
-            
-            if isinstance(close_val, pd.Series):
-                close_val = close_val.iloc[0] if len(close_val) > 0 else None
-            if isinstance(volume_val, pd.Series):
-                volume_val = volume_val.iloc[0] if len(volume_val) > 0 else None
-                
-            rows.append({
-                "date": date_str,
-                "close": float(close_val) if close_val is not None and not pd.isna(close_val) else None,
-                "volume": int(volume_val) if volume_val is not None and not pd.isna(volume_val) else None
-            })
+                close = float(close_val)
+            if pd.isna(volume_val):
+                volume = None
+            else:
+                volume = int(volume_val)
+            rows.append({"date": date_str, "close": close, "volume": volume})
         return rows
-    
-    def _get_all_tickers(self) -> List[str]:
-        tickers = self.col.distinct("ticker")
-        return tickers
 
-    def backfill_history(self, ticker, start_date=None, end_date=None):
+    def backfill_history(self, ticker: str, start_date: Optional[str] = None, end_date: Optional[str] = None):
         if isinstance(start_date, str):
-            start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+            start_date_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+        else:
+            start_date_dt = None
         if isinstance(end_date, str):
-            end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
-        end_date = end_date or datetime.now().date()
-        start_date = start_date or (end_date - timedelta(days=365))
+            end_date_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
+        else:
+            end_date_dt = datetime.now().date()
+
+        end_date_dt = end_date_dt or datetime.now().date()
+        start_date_dt = start_date_dt or (end_date_dt - timedelta(days=365))
 
         yahoo_ticker = self._normalize_ticker(ticker)
-        fetched = self._fetch_prices(yahoo_ticker, start_date, end_date)
+        fetched = self._fetch_prices_yfinance(yahoo_ticker, start_date_dt, end_date_dt)
         if not fetched:
+            logger.info(f"No fetched rows for {yahoo_ticker}")
             return
 
         doc = self.col.find_one({"ticker": yahoo_ticker}, {"history.date": 1})
         existing_dates = set()
         if doc and "history" in doc:
-            existing_dates = {h["date"] for h in doc["history"]}
+            existing_dates = {h["date"] for h in doc["history"] if h.get("date")}
 
-        new_rows = [row for row in fetched if row["date"] not in existing_dates]
-
+        new_rows = [r for r in fetched if r.get("date") not in existing_dates]
         if new_rows:
             self.col.update_one(
                 {"ticker": yahoo_ticker},
-                {
-                    "$push": {"history": {"$each": new_rows}},
-                    "$set": {"base_ticker": ticker if ticker != MARKET_TICKER else None}
-                },
-                upsert=True
+                {"$push": {"history": {"$each": new_rows}}, "$set": {"base_ticker": ticker if ticker != MARKET_TICKER else None}},
+                upsert=True,
             )
+            logger.info(f"Pushed {len(new_rows)} new history rows for {yahoo_ticker}")
+        else:
+            logger.info(f"No new history rows for {yahoo_ticker}")
 
-    def update_daily_price(self, ticker):
+    def update_daily_price(self, ticker: str):
         yahoo_ticker = self._normalize_ticker(ticker)
         today = datetime.now().date().strftime("%Y-%m-%d")
-
-        doc = self.col.find_one(
-            {"ticker": yahoo_ticker},
-            {"history.date": 1}
-        )
-
-        if doc and "history" in doc:
-            if any(h["date"] == today for h in doc["history"]):
-                return
-
-        prices = self._fetch_prices(yahoo_ticker, datetime.now().date(), datetime.now().date() + timedelta(days=1))
-        if not prices:
+        doc = self.col.find_one({"ticker": yahoo_ticker}, {"history.date": 1})
+        if doc and "history" in doc and any(h.get("date") == today for h in doc["history"]):
+            logger.debug(f"{yahoo_ticker} already has today's price.")
             return
 
+        prices = self._fetch_prices_yfinance(yahoo_ticker, datetime.now().date() - timedelta(days=1), datetime.now().date())
+        if not prices:
+            logger.info(f"No price fetched today for {yahoo_ticker}")
+            return
         self.col.update_one(
             {"ticker": yahoo_ticker},
-            {
-                "$push": {"history": {"$each": prices}},
-                "$set": {"base_ticker": ticker if ticker != MARKET_TICKER else None}
-            },
-            upsert=True
+            {"$push": {"history": {"$each": prices}}, "$set": {"base_ticker": ticker if ticker != MARKET_TICKER else None}},
+            upsert=True,
         )
+        logger.info(f"Updated daily prices for {yahoo_ticker}")
 
-    def get_price_history(self, ticker):
-        yahoo_ticker = self._normalize_ticker(ticker)
-        doc = self.col.find_one({"ticker": yahoo_ticker})
+    def get_price_history(self, ticker: str) -> List[Dict[str, Any]]:
+        doc = self.col.find_one({"ticker": ticker})
         if not doc:
             return []
         return doc.get("history", [])
 
 
+# ---------------------------
+# ESM Calculator (Batch LLM Ranking)
+# ---------------------------
 class ESMCalculator:
-
-    def __init__(self):
-        self.client = get_mongo_client()
-        self.db = self.client[DB_NAME]
+    def __init__(self, mongo_uri: str = MONGO_URI, db_name: str = DB_NAME):
+        self.client = MongoClient(mongo_uri)
+        self.db = self.client[db_name]
         self.price_col = self.db[PRICE_COLLECTION]
         self.insights_col = self.db[INSIGHTS_COLLECTION]
-        self.market_col = self.db[PRICE_COLLECTION] 
-        self.ticker_map = self._load_ticker_map()
-        self.GEMINI_MODEL = "gemini-2.5-flash" 
-        self.gemini_client = genai.Client(api_key="api")
+        self.rankings_col = self.db[RANKINGS_COLLECTION]
         self._price_cache: Dict[str, pd.DataFrame] = {}
+        self.market_ticker = MARKET_TICKER
 
-    def _clean_company_name(self, company_name: str) -> str:
-        return company_name.upper().replace('LIMITED', '').replace('LTD.', '').replace('LTD', '').replace('.', '').strip()
-
-    def _load_ticker_map(self) -> Dict[str, str]:
-        if not os.path.exists(TICKER_CSV_PATH):
-            logger.error(f"TICKER CSV not found at {TICKER_CSV_PATH}")
-            return {}
-
-        try:
-            df = pd.read_csv(TICKER_CSV_PATH)
-            
-            name_col = next((col for col in df.columns if 'company' in col.lower() or 'name' in col.lower()), None)
-            ticker_col = "TICKER"
-
-            if not name_col or ticker_col not in df.columns:
-                logger.error("Could not find required Company Name or TICKER columns in CSV")
-                return {}
-            
-            df['clean_name'] = df[name_col].astype(str).str.upper().str.replace(r'LTD\.?', '', regex=True).str.replace(r'\s+LTD\s*', '', regex=True).str.replace(r'\.', '', regex=False).str.strip()
-            df['ticker'] = df[ticker_col].astype(str)
-            
-            ticker_map = df.set_index('clean_name')['ticker'].to_dict()
-            
-            logger.info(f"Loaded {len(ticker_map)} ticker mappings into memory")
-            return ticker_map
-        except Exception as e:
-            logger.error(f"Error loading ticker map from CSV: {e}")
-            return {}
-
-    def _get_ticker_by_company_name(self, company_name: str) -> Optional[str]:
-        clean_input_name = self._clean_company_name(company_name)
-        
-        base_ticker = None
-        for key, value in self.ticker_map.items():
-            if key == clean_input_name:
-                base_ticker = value
-                break
-        
-        if not base_ticker:
-            logger.warning(f"Company not found in map: {company_name}")
-            return None
-        
-        # Check if the fully qualified ticker exists in the price collection
-        for suffix in ['.NS', '.BO']:
-            full_ticker = f"{base_ticker}{suffix}"
-            if self.price_col.find_one({'ticker': full_ticker}):
-                return full_ticker
-        
-        logger.warning(f"No price data found for {company_name} on NSE or BSE")
-        return None
-
+    # ---------------------------
+    # Price helpers
+    # ---------------------------
     def _fetch_price_df(self, ticker: str) -> Optional[pd.DataFrame]:
-        """Fetch price history from MongoDB and cache it as a DataFrame."""
+        """Load price history from Mongo and cache as DataFrame indexed by datetime."""
+        if not ticker:
+            return None
         if ticker in self._price_cache:
             return self._price_cache[ticker]
 
-        doc = self.price_col.find_one({'ticker': ticker}, {'history': 1})
-        if not doc or not doc.get('history'):
+        doc = self.price_col.find_one({"ticker": ticker}, {"history": 1})
+        if not doc or not doc.get("history"):
             return None
-        
-        df = pd.DataFrame(doc['history']).set_index('date')
+
+        df = pd.DataFrame(doc["history"])
+        if df.empty:
+            return None
+
+        if "date" not in df.columns:
+            return None
+        df = df.set_index("date")
+        # Ensure datetime index
         df.index = pd.to_datetime(df.index)
-        
-        if 'close' in df.columns:
-            df['close'] = pd.to_numeric(df['close'], errors='coerce')
-        
+        if "close" in df.columns:
+            df["close"] = pd.to_numeric(df["close"], errors="coerce")
         self._price_cache[ticker] = df.sort_index()
         return self._price_cache[ticker]
 
-    # ------------------ CONSOLIDATED LLM RANKING ------------------
-
-    def _calculate_llm_ranking_metrics(self, company_name: str, event_date_str: str, insight: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Calculates a single 'ranking_score' by instructing the LLM to perform a 
-        comprehensive assessment of fundamentals (insight) AND price reaction (data snapshot).
-        All intermediate quantitative metrics (CAR, Beta) are inferred and used internally by the LLM 
-        to determine the final score, but are not returned.
-        """
-        ticker = self._get_ticker_by_company_name(company_name)
-        
-        FALLBACK_LLM_METRICS = {
-            'ranking_score': 0.0,
-            'esm_ticker': ticker or 'N/A'
-        }
-        
-        if not ticker:
-            logger.warning(f"LLM Ranking Fallback: No ticker found for {company_name}")
-            return FALLBACK_LLM_METRICS
-            
+    def _compute_event_price_stats(self, ticker: str, event_dt: datetime) -> Dict[str, Any]:
+        """Compute estimation stats and event window returns for use in LLM prompt."""
+        result = {"available": False, "estimation_stats": {}, "event_window_returns": [], "event_days": 0}
         stock_df = self._fetch_price_df(ticker)
-        market_df = self._fetch_price_df(MARKET_TICKER)
+        market_df = self._fetch_price_df(self.market_ticker)
+        if stock_df is None or market_df is None:
+            return result
 
-        # Skip price data handling if data is missing, but still attempt ranking based on qualitative data
-        has_price_data = False
-        if stock_df is not None and market_df is not None and not stock_df.empty and not market_df.empty:
-            
-            # 1. Prepare Returns Data (Essential for price context)
-            stock_df['Stock_Return'] = stock_df['close'].pct_change()
-            market_df['Market_Return'] = market_df['close'].pct_change()
-            
-            df = pd.merge(stock_df[['Stock_Return']], market_df[['Market_Return']], left_index=True, right_index=True).dropna()
-            
-            if not df.empty:
-                event_dt = pd.to_datetime(event_date_str)
+        # compute daily returns
+        if "close" not in stock_df.columns or "close" not in market_df.columns:
+            return result
 
-                # 2. Extract Estimation/Event Window Data
-                estimation_end_dates = df.index[df.index < event_dt]
-                if not estimation_end_dates.empty:
-                    estimation_end = estimation_end_dates.max()
-                    estimation_df = df.loc[:estimation_end].tail(ESTIMATION_WINDOW) 
-                    
-                    event_start = event_dt - timedelta(days=EVENT_WINDOW_DAYS // 2)
-                    event_window_df = df.loc[event_start:event_dt + timedelta(days=EVENT_WINDOW_DAYS // 2)]
-                    
-                    if len(estimation_df) >= 100 and not event_window_df.empty:
-                         has_price_data = True
+        stock_df = stock_df.copy()
+        market_df = market_df.copy()
+        stock_df["Stock_Return"] = stock_df["close"].pct_change()
+        market_df["Market_Return"] = market_df["close"].pct_change()
 
-        # Package data for LLM
-        prompt_data = {
-            'company': company_name,
-            'event_date': event_date_str,
-            'fundamentals': insight.get('metrics', {}),
-            'sentiment_score_finbert': insight.get('sentiment_score', 0),
-            'key_highlights': insight.get('metrics', {}).get('key_highlights', []),
-            'price_data_snapshot': {
-                'available': has_price_data,
-                'estimation_period_stats': {
-                    'stock_mean_return': estimation_df['Stock_Return'].mean() if has_price_data else 'N/A',
-                    'market_mean_return': estimation_df['Market_Return'].mean() if has_price_data else 'N/A',
-                    'correlation': estimation_df['Stock_Return'].corr(estimation_df['Market_Return']) if has_price_data else 'N/A'
-                },
-                'event_period_returns_table': event_window_df.to_json(orient='table', index=True) if has_price_data else 'N/A',
-                'event_days': len(event_window_df) if has_price_data else 0,
-            }
+        merged = pd.merge(stock_df[["Stock_Return"]], market_df[["Market_Return"]], left_index=True, right_index=True).dropna()
+        if merged.empty:
+            return result
+
+        event_dt = pd.to_datetime(event_dt)
+        estimation_end = merged.index[merged.index < event_dt]
+        if estimation_end.empty:
+            return result
+        estimation_end = estimation_end.max()
+        estimation_df = merged.loc[:estimation_end].tail(ESTIMATION_WINDOW)
+
+        if estimation_df.empty or len(estimation_df) < 50:
+            # not enough estimation data
+            return result
+
+        # event window centered on event date
+        half_win = EVENT_WINDOW_DAYS // 2
+        event_start = event_dt - pd.Timedelta(days=half_win)
+        event_end = event_dt + pd.Timedelta(days=half_win)
+        event_window_df = merged.loc[event_start:event_end]
+
+        result["available"] = not event_window_df.empty
+        result["estimation_stats"] = {
+            "stock_mean_return": float(estimation_df["Stock_Return"].mean()),
+            "market_mean_return": float(estimation_df["Market_Return"].mean()),
+            "correlation": float(estimation_df["Stock_Return"].corr(estimation_df["Market_Return"])),
+            "estimation_samples": int(len(estimation_df)),
         }
-        
-        llm_prompt = (
-            "You are an expert financial analyst. Your task is to generate a single composite ranking score "
-            "based on a complete assessment of the earnings event. "
-            "You must integrate the company's financial fundamentals, analyst sentiment, AND the stock's price reaction "
-            "during the event window (if price data is available).\n\n"
-            
-            "**Data Provided:**\n"
-            f"{json.dumps(prompt_data, indent=2)}\n\n"
-            
-            "**Instructions:**\n"
-            "1. **Comprehensive Assessment:** Analyze the fundamentals (revenue growth, PAT, EBITDA) and the sentiment. If 'price_data_snapshot.available' is true, analyze the price reaction. If the stock reacted positively (relative to the market) to good news, this increases the score. If price data is unavailable or unreliable, base the score *only* on fundamentals and sentiment.\n"
-            "2. **ranking_score:** Generate a single 'ranking_score' between **-1.0 (Worst Event/Investment)** and **1.0 (Best Event/Investment)**. This score is a composite reflection of the event's overall investment merit.\n\n"
-            
-            "**Output Format (STRICTLY adhere to this JSON format only. Do not include any explanations or extra text or fields other than 'ranking_score'):**\n"
-            "```json\n"
-            "{\n"
-            "   \"ranking_score\": <float value between -1 and 1>\n"
-            "}\n"
-            "```"
-        )
-        
-        try:
-            response = self.gemini_client.models.generate_content(
-                model=self.GEMINI_MODEL,
-                contents=llm_prompt
+        if not event_window_df.empty:
+            result["event_window_returns"] = (
+                event_window_df[["Stock_Return", "Market_Return"]].reset_index().to_dict(orient="records")
             )
-            time.sleep(1.5) 
-            
-            # Extract JSON from the response text
-            json_text = response.text.strip().replace('```json', '').replace('```', '').strip()
-            llm_metrics = json.loads(json_text)
+            result["event_days"] = len(event_window_df)
+        else:
+            result["event_window_returns"] = []
+            result["event_days"] = 0
+        return result
 
-            # Validate and return the LLM results
-            return {
-                'ranking_score': float(llm_metrics.get('ranking_score', 0.0)),
-                'esm_ticker': ticker
-            }
-        except Exception as e:
-            logger.error(f"Gemini LLM Ranking failed for {company_name}: {e}. Returning fallback values.")
-            return FALLBACK_LLM_METRICS
+    # ---------------------------
+    # Single Gemini batch call
+    # ---------------------------
+    def _get_batch_llm_rankings(self, insights_batch: List[Dict[str, Any]]) -> Dict[str, float]:
+        """
+        Calls Gemini ONCE with all insights and returns mapping: { insight_id_str: ranking_score }.
+        The prompt provides fundamentals, sentiment and price snapshot (if available).
+        """
+        if gemini_client is None:
+            logger.error("Gemini client not initialized - GEMINI_API_KEY missing.")
+            return {}
 
+        compact = []
+        for ins in insights_batch:
+            ins_id = str(ins["_id"])
+            company = ins.get("company")
+            event_date = ins.get("date")
+            metrics = ins.get("metrics", {})
+            sentiment = ins.get("sentiment_score", 0)
 
-    # ------------------ LLM-Based Comparison & Ranking Rationale ------------------
+            # Try to compute price snapshot for this insight's company
+            ticker_guess = None
+            # if insight already has esm_ticker, use it; otherwise attempt to fallback to metrics.ticker if present
+            if ins.get("esm_ticker"):
+                ticker_guess = ins.get("esm_ticker")
+            elif metrics.get("ticker"):
+                ticker_guess = metrics.get("ticker")
+            else:
+                # No guaranteed ticker: leave None
+                ticker_guess = None
 
-    def _get_comparison_rationale(self, results: List[Dict[str, Any]]) -> str:
-        """Uses LLM to provide a comparative analysis of the top-ranked events."""
-        if not results:
-            return "No rankable events found for comparison."
+            price_snapshot = {}
+            if ticker_guess:
+                try:
+                    price_snapshot = self._compute_event_price_stats(ticker_guess, event_date)
+                except Exception as e:
+                    logger.debug(f"Price snapshot compute failed for {ticker_guess}@{event_date}: {e}")
+                    price_snapshot = {}
 
-        # Pass only the critical data points for the top 10 to the LLM
-        top_data = results[:10]
-        
-        comparison_data = [
-            {
-                'rank': r['rank'],
-                'company': r['company'],
-                'event_date': r['event_date'],
-                'Ranking Score': f"{r['ranking_score']:.4f}",
-                'Revenue YoY Change %': r.get('revenue_yoy_change', 'N/A'),
-                'Key Highlights': r.get('key_highlights', [])[:1] # Keep only 1 highlight
-            } for r in top_data
-        ]
-        
+            compact.append(
+                {
+                    "id": ins_id,
+                    "company": company,
+                    "event_date": event_date,
+                    "fundamentals": metrics,
+                    "sentiment_score": sentiment,
+                    "price_snapshot": price_snapshot,
+                }
+            )
+
+        # Build the LLM prompt
+        # Keep the instructions strict: JSON array of {id, ranking_score}
         prompt = (
-            "Analyze the following list of top financial event results, ranked by the Composite Ranking Score. "
-            "The Ranking Score integrates the company's fundamental performance, news sentiment, and the market's price reaction to the news. "
-            "Provide a concise summary (under 5 sentences) of why the top-ranked company achieved the highest score. "
-            "Focus your analysis on the combination of its Revenue YoY Change and Key Highlights compared to the other top-ranked companies."
-            f"Data for Comparison (Top {len(comparison_data)}):\n{json.dumps(comparison_data, indent=2)}"
+            "You are an expert financial analyst. You will be given a JSON array of earnings events.\n"
+            "For each event, produce a single 'ranking_score' between -1.0 (worst) and 1.0 (best).\n"
+            "Consider: fundamentals (PAT, EBITDA, revenue growth), sentiment_score, price snapshots (if available), and contextual data (key highlights).\n"
+            "Weight allocation: fundamentals (40%), sentiment_score (25%), price snapshot (20%), contextual data (15%).\n"
+            "Return strictly a JSON array where each element is `{ \"id\": \"<id>\", \"ranking_score\": <float> }`."
+            "Do NOT include any other text.\n\n"
+            "INPUT:\n"
+            f"{json.dumps(compact, indent=2)}\n"
         )
 
+        # call gemini once
         try:
-            r = self.gemini_client.models.generate_content(
-                model=self.GEMINI_MODEL,
-                contents=prompt
-            )
-            time.sleep(1.5)
-            return r.text.strip()
+            response = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+            # small pause if necessary
+            time.sleep(0.5)
+            text = response.text.strip()
+            # remove triple backticks if present
+            text = text.replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(text)
+            if not isinstance(parsed, list):
+                logger.error("Unexpected Gemini response format: expected JSON array.")
+                return {}
+            mapping = {}
+            for elem in parsed:
+                _id = str(elem.get("id"))
+                score = float(elem.get("ranking_score", 0.0))
+                mapping[_id] = score
+            return mapping
         except Exception as e:
-            logger.error(f"Gemini comparison rationale failed: {e}")
-            return "Failed to generate comparative rationale using LLM."
+            logger.error(f"Gemini batch ranking call failed: {e}")
+            return {}
 
-
+    # ---------------------------
+    # Run bulk analysis (entrypoint)
+    # ---------------------------
     def run_bulk_analysis(self, start_date_str: str, end_date_str: str) -> List[Dict[str, Any]]:
-        time_cutoff = datetime.strptime(start_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
-        
-        insights_cursor = self.insights_col.find({
-            "date": {"$gte": time_cutoff, "$lte": end_date_str}
-        }).sort("date", -1)
-        
-        total_insights = self.insights_col.count_documents({
-            "date": {"$gte": time_cutoff, "$lte": end_date_str}
-        })
-        logger.info(f"Found {total_insights} total insights in date range {start_date_str} to {end_date_str}")
-        
-        ranking_results = []
-        processed_count = 0
-        skipped_count = 0
-        
-        for insight in insights_cursor:
-            processed_count += 1
-            event_date = insight.get('date')
-            company_name = insight.get('company')
-            
-            if not event_date or not company_name:
-                logger.warning(f"Skipping insight {insight.get('_id')}: missing date or company")
-                skipped_count += 1
-                continue
-                
-            sentiment = insight.get('sentiment_score', 0)
-            if sentiment is None:
-                sentiment = 0
-            
-            # Single call for the composite ranking score
-            llm_metrics = self._calculate_llm_ranking_metrics(company_name, event_date, insight)
-            ranking_score = llm_metrics['ranking_score']
-            
-            # Update insight, removing old fields
-            self.insights_col.update_one(
-                {'_id': insight['_id']},
-                {'$set': {
-                    'ranking_score': ranking_score,
-                    'esm_ticker': llm_metrics['esm_ticker']
-                },
-                '$unset': { # Explicitly remove old fields
-                    'esm_car': "", 
-                    'composite_score': "",
-                    'esm_alpha': "",
-                    'esm_beta': "",
-                    'car_period_days': ""
-                }}
+        """
+        High-level: fetch unranked insights in date range, compute a single batch Gemini call
+        to obtain ranking_scores for all, then update insights collection and upsert into rankings.
+        Returns list of final ranking docs (sorted).
+        """
+        # Defensive date parsing
+        start_date_cutoff = start_date_str
+        end_date_cutoff = end_date_str
+
+        query = {
+            "date": {"$gte": start_date_cutoff, "$lte": end_date_cutoff},
+            "ranking_score": {"$exists": False},
+        }
+        logger.info(f"Querying insights: {query}")
+        insights_cursor = self.insights_col.find(query).sort("date", -1)
+        insights_to_process = list(insights_cursor)
+        logger.info(f"Found {len(insights_to_process)} unranked insights.")
+
+        if not insights_to_process:
+            return []
+
+        # single LLM call for all insights
+        logger.info("Preparing batch LLM payload for Gemini...")
+        ranking_map = self._get_batch_llm_rankings(insights_to_process)
+        logger.info(f"Received {len(ranking_map)} ranking entries from Gemini.")
+
+        # Prepare bulk DB ops
+        insights_update_ops = []
+        rankings_upsert_ops = []
+        results = []
+
+        for ins in insights_to_process:
+            ins_id = ins["_id"]
+            ins_id_str = str(ins_id)
+            company = ins.get("company")
+            metrics = ins.get("metrics", {})
+            sentiment = ins.get("sentiment_score", 0)
+
+            score = float(ranking_map.get(ins_id_str, 0.0))
+            # determine esm_ticker (best-effort): prefer existing field, otherwise attempt using metrics.ticker
+            esm_ticker = ins.get("esm_ticker") or metrics.get("ticker") or None
+
+            # update original insight doc with ranking_score and esm_ticker
+            insights_update_ops.append(
+                UpdateOne(
+                    {"_id": ins_id},
+                    {
+                        "$set": {"ranking_score": float(f"{score:.6f}"), "esm_ticker": esm_ticker},
+                        "$unset": {"esm_car": "", "composite_score": "", "car_period_days": ""},
+                    },
+                )
             )
-            logger.info(f"Composite Ranking calculated (LLM) for {company_name}: Ranking={ranking_score:.4f}")
-            
-            ranking_results.append({
-                'company': company_name,
-                'ticker': llm_metrics.get('esm_ticker', self._get_ticker_by_company_name(company_name)), 
-                'event_date': event_date,
-                'quarter': insight.get('metrics', {}).get('quarter'),
-                'ranking_score': float(f"{ranking_score:.6f}"),
-                'sentiment': sentiment,
-                # Flatten metrics data for easy dashboard consumption
-                'revenue_current': insight.get('metrics', {}).get('revenue_current_qtr'),
-                'pat_current': insight.get('metrics', {}).get('pat_current_qtr'),
-                'ebitda_current': insight.get('metrics', {}).get('ebitda_current_qtr'),
-                'revenue_yoy_change': insight.get('metrics', {}).get('revenue_yoy_change_pct'),
-                'key_highlights': insight.get('metrics', {}).get('key_highlights', [])
-            })
-        
-        # Sort results and assign ranks
-        ranking_results.sort(key=lambda x: x['ranking_score'], reverse=True)
-        for i, result in enumerate(ranking_results):
-            result['rank'] = i + 1
-        
-        # --- LLM-BASED COMPARISON ---
-        comparison_rationale = self._get_comparison_rationale(ranking_results)
-        logger.info(f"\n--- Comparative Ranking Rationale ---\n{comparison_rationale}\n-----------------------------------")
-        
-        logger.info(f"Bulk Composite Ranking analysis complete. Processed {processed_count} insights, skipped {skipped_count}, found {len(ranking_results)} rankable events.")
-        
-        return ranking_results
+
+            # final flattened doc for rankings collection (preserve _id)
+            final_doc = {
+                "_id": ins_id,
+                "company": company,
+                "ticker": esm_ticker,
+                "date": ins.get("date"),
+                "ranking_score": float(f"{score:.6f}"),
+                "quarter": metrics.get("quarter"),
+                "sentiment": sentiment,
+                "revenue_current": metrics.get("revenue_current_qtr"),
+                "pat_current": metrics.get("pat_current_qtr"),
+                "ebitda_current": metrics.get("ebitda_current_qtr"),
+                "revenue_yoy_change": metrics.get("revenue_yoy_change_pct"),
+                "key_highlights": metrics.get("key_highlights", []),
+            }
+
+            rankings_upsert_ops.append(UpdateOne({"_id": ins_id}, {"$set": final_doc}, upsert=True))
+            results.append(final_doc)
+
+        # execute bulk writes
+        try:
+            if insights_update_ops:
+                res = self.insights_col.bulk_write(insights_update_ops, ordered=False)
+                logger.info(f"Updated {res.modified_count} insight documents with ranking_score.")
+        except BulkWriteError as bwe:
+            logger.error(f"Bulk write error updating insights: {bwe.details}")
+
+        try:
+            if rankings_upsert_ops:
+                res2 = self.rankings_col.bulk_write(rankings_upsert_ops, ordered=False)
+                logger.info(f"Inserted/Updated {len(rankings_upsert_ops)} ranking documents (upsert).")
+        except BulkWriteError as bwe:
+            logger.error(f"Bulk write error upserting rankings: {bwe.details}")
+
+        # sort and attach rank index
+        results.sort(key=lambda x: x["ranking_score"], reverse=True)
+        for idx, r in enumerate(results):
+            r["rank"] = idx + 1
+
+        # Optionally: produce a short rationale using Gemini for the top results (single extra call)
+        # Keep this optional and lightweight. If you want it enabled, set environment var GENERATE_COMPARISON_RATIONALE=true
+        if os.getenv("GENERATE_COMPARISON_RATIONALE", "false").lower() in ("1", "true", "yes"):
+            try:
+                top_for_rationale = results[:10]
+                comp_prompt = (
+                    "You are an expert financial analyst. Provide a concise (max 3-sentence) summary "
+                    "explaining why the top-ranked company achieved the highest score compared to peers. "
+                    "Focus on revenue YoY change and key highlights.\n\n"
+                    f"DATA: {json.dumps(top_for_rationale, default=str, indent=2)}\n\n"
+                    "Return only plain text summary (no JSON)."
+                )
+                resp = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=comp_prompt)
+                time.sleep(0.3)
+                rationale = resp.text.strip()
+                logger.info(f"Comparative Rationale:\n{rationale}")
+            except Exception as e:
+                logger.error(f"Failed to generate comparative rationale: {e}")
+
+        logger.info(f"Bulk composite ranking analysis complete. Processed {len(results)} events.")
+        return results
 
 
-# ===================== Utility Functions =====================
+# ---------------------------
+# External wrapper functions (pipeline entrypoints)
+# ---------------------------
+def run_esm_backfill(ticker_list: List[str], start_date: Optional[str] = None, end_date: Optional[str] = None):
+    """
+    Backfill historical prices for given tickers using StockPriceManager.
+    ticker_list: list of tickers (strings)
+    """
+    spm = StockPriceManager()
+    for t in ticker_list:
+        try:
+            spm.backfill_history(t, start_date=start_date, end_date=end_date)
+        except Exception as e:
+            logger.error(f"Backfill failed for {t}: {e}")
+    spm.client.close()
+
+
+def run_esm_daily_update(ticker_list: List[str]):
+    spm = StockPriceManager()
+    for t in ticker_list:
+        try:
+            spm.update_daily_price(t)
+        except Exception as e:
+            logger.error(f"Daily update failed for {t}: {e}")
+    spm.client.close()
+
+
+def run_esm_bulk_analysis(start_date: str, end_date: str):
+    esm = ESMCalculator()
+    logger.info(f"Running BULK COMPOSITE RANKING ANALYSIS for insights from {start_date} to {end_date}")
+    results = esm.run_bulk_analysis(start_date, end_date)
+    esm.client.close()
+    return results
 
 def esm_already_exists_for_today():
     """Check if ranking analysis has been done for today - checks for ranking_score presence"""
     try:
         client = get_mongo_client()
         db = client[DB_NAME]
-        insights_col = db[INSIGHTS_COLLECTION]
-        
-        today = datetime.now().strftime("%Y-%m-%d")
-        existing = insights_col.find_one({
-            "date": today,
+        existing = db[INSIGHTS_COLLECTION].find_one({
+            "date": datetime.now().strftime("%Y-%m-%d"),
             "ranking_score": {"$exists": True}
         })
-        
         client.close()
         return existing is not None
     except Exception as e:
         logger.error(f"Error checking if Ranking exists for today: {e}")
         return False
 
-def run_esm_backfill(start_date: str, end_date: str):
-    price_manager = StockPriceManager()
-    logger.info(f"Starting BULK BACKFILL from {start_date} to {end_date}")
-    
-    price_manager.backfill_history(MARKET_TICKER, start_date=start_date, end_date=end_date)
-    
-    for ticker in price_manager._get_all_tickers():
-        price_manager.backfill_history(ticker, start_date=start_date, end_date=end_date)
-        
-    price_manager.client.close()
-    logger.info("BULK BACKFILL complete.")
-
-def run_esm_daily_update(daily_date):
-    price_manager = StockPriceManager()
-    logger.info(f"Running DAILY PRICE UPDATE for {daily_date}")
-    
-    if isinstance(daily_date, str):
-        daily_date = datetime.strptime(daily_date, "%Y-%m-%d")
-
-    daily_3d_ago = daily_date - timedelta(days=3)
-    
-    # Update market ticker first
-    price_manager.backfill_history(MARKET_TICKER, start_date=daily_3d_ago, end_date=daily_date)
-    
-    # Update all stock tickers
-    for ticker in price_manager._get_all_tickers():
-        try:
-            price_manager.backfill_history(ticker, start_date=daily_3d_ago, end_date=daily_date)
-        except Exception as e:
-            logger.error(f"Error updating {ticker}: {e}")
-            continue
-            
-    price_manager.client.close()
-    logger.info("DAILY PRICE UPDATE complete.")
-
-def run_esm_bulk_analysis(start_date: str, end_date: str):
-    esm = ESMCalculator()
-    logger.info(f"Running BULK COMPOSITE RANKING ANALYSIS for insights from {start_date} to {end_date}")
-    
-    results = esm.run_bulk_analysis(start_date, end_date)
-    
-    logger.info(f"Bulk Composite Ranking analysis produced {len(results)} rankable events.")
-    
-    if results:
-        top_results = results[:10]
-        logger.info(f"Top 10 Rankings:\n{json.dumps(top_results, indent=2)}") 
-        
-    esm.client.close()
-    return results
-
-
-# ===================== Main =====================
-
-def main():
-    parser = argparse.ArgumentParser(description="BSE ESM Pipeline Coordinator")
-    parser.add_argument('mode', choices=['backfill', 'daily_price_update', 'bulk_esm_analysis'], 
-                         help="Mode of operation")
-    parser.add_argument('--start', type=str, help="Start date for backfill/analysis (YYYY-MM-DD)")
-    parser.add_argument('--end', type=str, help="End date for backfill/analysis (YYYY-MM-DD). Defaults to today")
-    
-    args = parser.parse_args()
-    
-    end_date = args.end if args.end else date_to_string(datetime.now())
-    
-    if args.mode in ['backfill', 'daily_price_update']:
-        price_manager = StockPriceManager()
-        
-        if args.mode == 'backfill':
-            start_date = args.start if args.start else date_to_string(datetime.now() - timedelta(days=40))
-            
-            logger.info(f"Running backfill from {start_date} to {end_date}")
-            run_esm_backfill(start_date, end_date)
-            
-        elif args.mode == 'daily_price_update':
-            today_str = date_to_string(datetime.now())
-            
-            if not esm_already_exists_for_today():
-                run_esm_daily_update(today_str)
-            else:
-                logger.info("Ranking analysis already exists for today, skipping daily update")
-        
-        price_manager.client.close()
-    
-    elif args.mode == 'bulk_esm_analysis':
-        start_date = args.start if args.start else date_to_string(datetime.now() - timedelta(days=30))
-        logger.info(f"Running bulk Composite Ranking analysis for {start_date} to {end_date}")
-        run_esm_bulk_analysis(start_date, end_date)
-
+# ---------------------------
+# CLI
+# ---------------------------
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="ESM Pipeline (clean single-file)")
+    parser.add_argument("mode", choices=["backfill", "daily_price_update", "bulk_esm_analysis"], help="Mode")
+    parser.add_argument("--start", type=str, help="Start date YYYY-MM-DD (for backfill/analysis)", default=None)
+    parser.add_argument("--end", type=str, help="End date YYYY-MM-DD (for backfill/analysis)", default=None)
+    parser.add_argument("--tickers", type=str, help="Comma-separated tickers for backfill/daily", default=None)
+
+    args = parser.parse_args()
+
+    if args.mode == "backfill":
+        tickers = args.tickers.split(",") if args.tickers else []
+        run_esm_backfill(tickers, start_date=args.start, end_date=args.end)
+    elif args.mode == "daily_price_update":
+        tickers = args.tickers.split(",") if args.tickers else []
+        run_esm_daily_update(tickers)
+    elif args.mode == "bulk_esm_analysis":
+        end_date = args.end if args.end else date_to_string(datetime.now())
+        start_date = args.start if args.start else date_to_string(datetime.now() - timedelta(days=30))
+        run_esm_bulk_analysis(start_date, end_date)

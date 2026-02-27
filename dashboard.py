@@ -20,7 +20,7 @@ API_URL = "http://localhost:8000"
 st.markdown("""
     <style>
     .stMetric {
-        background-color: #e0e0e0 ;
+        background-color: #0000ff ;
         padding: 15px;
         border-radius: 8px;
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
@@ -160,12 +160,11 @@ if rankings_data and rankings_data.get('rankings'):
     
     # --- DATA PROCESSING ---
     df['signal'], df['signal_label'], df['signal_color'] = zip(*df.apply(get_trading_signal, axis=1))
-    df['sentiment_label'] = df['sentiment'].apply(get_sentiment_label)
+    df['sentiment_label'] = df['sentiment']
     
     # Robust date parsing
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
     
-    # Handle NaN values for columns used in Plotly 'size' argument
     if 'revenue_current' in df.columns:
         median_rev = df['revenue_current'].median() if df['revenue_current'].notna().any() else 1
         df['revenue_current_plot'] = df['revenue_current'].fillna(median_rev)
@@ -209,7 +208,6 @@ if rankings_data and rankings_data.get('rankings'):
                 'Rank': row['rank'], # Now safely accessible
                 'Signal': row['signal'],
                 'Company': row['company'],
-                'Ticker': row.get('ticker', 'N/A'),
                 'Date': row['date'].strftime('%d-%b'),
                 'Ranking Score': f"{row['ranking_score']:.4f}",
                 'Sentiment': row['sentiment_label'],

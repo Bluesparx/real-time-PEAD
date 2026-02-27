@@ -120,8 +120,6 @@ def calculate_start_date(months_ago=3):
     start_date = today - timedelta(days=30 * months_ago)
     return start_date.strftime("%Y-%m-%d")
 
-## Scraper Logic
-# ------------------------
 
 async def get_session_cookies():
     """Open BSE announcements page once to gather cookies and user agent."""
