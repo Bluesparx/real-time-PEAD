@@ -24,7 +24,6 @@ from pymongo import MongoClient, UpdateOne
 from pymongo.errors import BulkWriteError
 from bson.objectid import ObjectId
 
-# NOTE: google.genai usage retained; require GOOGLE GENAI client installed & configured
 from google import genai
 
 # ---------------------------
