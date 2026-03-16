@@ -29,6 +29,13 @@ logging.basicConfig(
 logger = logging.getLogger("bse_api")
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 class PyObjectId(ObjectId):
     @classmethod
     def __get_pydantic_core_schema__(cls, _source_type, handler):
@@ -108,6 +115,12 @@ result_calendar_collection = db["result_calendar"]
 
 rankings_collection = db["rankings"] 
 
+STARTUP_BACKFILL_DAYS = _env_int("STARTUP_BACKFILL_DAYS", 30)
+STARTUP_LLM_LIMIT = _env_int("STARTUP_LLM_LIMIT", 250)
+DAILY_LLM_LIMIT = _env_int("DAILY_LLM_LIMIT", 120)
+DAILY_CRON_HOUR = _env_int("DAILY_CRON_HOUR", 18)
+DAILY_CRON_MINUTE = _env_int("DAILY_CRON_MINUTE", 0)
+
 
 class LogResponseMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -127,20 +140,20 @@ def safe_float(value, default=None):
 
 
 def format_insight_for_ranking(doc: dict) -> dict:
-    """Formats a MongoDB insight document into the streamlined RankingResponse structure."""
-    
-    metrics = doc.get("metrics", {})
-    
+    """Formats a MongoDB rankings document into the streamlined RankingResponse structure."""
     return {
         "_id": str(doc["_id"]),
         "company": doc.get("company"),
-        "date": doc.get("date"),    
+        "ticker": doc.get("ticker"),
+        "date": doc.get("date"),
+        "ranking_score": safe_float(doc.get("ranking_score")),
+        "quarter": doc.get("quarter"),
+        "sentiment": safe_float(doc.get("sentiment")),
         "revenue_current": safe_float(doc.get("revenue_current")),
         "pat_current": safe_float(doc.get("pat_current")),
-        "ebitda_current": doc.get("ebitda_current"),
+        "ebitda_current": safe_float(doc.get("ebitda_current")),
         "revenue_yoy_change": safe_float(doc.get("revenue_yoy_change")),
-        
-        "key_highlights": doc.get("key_highlights", [])
+        "key_highlights": doc.get("key_highlights", []),
     }
 
 
@@ -150,30 +163,16 @@ async def daily_pipeline_job():
         logger.error("Scheduler failed: Pipeline Orchestrator is not initialized.")
         return
     try:
-        results = await orchestrator.run_full_pipeline(days_ago=1, limit=50)
+        results = await orchestrator.run_daily_pipeline(limit=DAILY_LLM_LIMIT)
+        logger.info("Daily pipeline completed: %s", results)
         return results
     except Exception as e:
         logger.error(f"Daily pipeline failed: {e}", exc_info=True)
 
-async def esm_daily_job():
-    global orchestrator
-    if not orchestrator:
-        logger.error("ESM pipeline skipped: orchestrator not initialized")
-        return
 
-    # Check if today's ESM data already exists 
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    existing = insights_collection.count_documents({"date": today_str})
-    if existing > 0:
-        logger.info(f"ESM data for {today_str} already exists. Skipping pipeline.")
-        return
-
-    try:
-        logger.info(f"Running ESM pipeline for {today_str}")
-        await orchestrator.run_esm_pipeline(days_ago=0)
-        logger.info("ESM pipeline completed successfully")
-    except Exception as e:
-        logger.error(f"ESM pipeline failed: {e}", exc_info=True)
+def should_run_initial_backfill() -> bool:
+    """Run long backfill only for a new/empty project state."""
+    return announcements_collection.estimated_document_count() == 0
 
 
 async def lifespan(app: FastAPI):
@@ -183,7 +182,8 @@ async def lifespan(app: FastAPI):
         esm_calculator = ESMCalculator()
         orchestrator = PipelineOrchestrator(MONGO_URI, DB_NAME)
         logger.info("ESM Calculator and Pipeline Orchestrator initialized")
-    except Exception:
+    except Exception as e:
+        logger.error(f"Failed to initialize ESM Calculator or Pipeline Orchestrator: {e}", exc_info=True)
         yield
         return
 
@@ -191,33 +191,40 @@ async def lifespan(app: FastAPI):
         scheduler = AsyncIOScheduler()
 
         scheduler.add_job(
-            esm_daily_job,
-            "cron",
-            day_of_week="mon-fri",
-            hour=15,
-            minute=30,
-            id="esm_daily_job"
-        )
-
-        scheduler.add_job(
             daily_pipeline_job,
             "cron",
             day_of_week="mon-fri",
-            hour="*",
-            minute=0,
-            id="weekday_hourly_pipeline"
+            hour=DAILY_CRON_HOUR,
+            minute=DAILY_CRON_MINUTE,
+            id="daily_pipeline_job"
         )
 
         scheduler.start()
-        logger.info("APScheduler started with weekday hourly cron.")
+        logger.info(
+            "APScheduler started with weekday daily cron at %02d:%02d.",
+            DAILY_CRON_HOUR,
+            DAILY_CRON_MINUTE,
+        )
     except Exception as e:
         logger.error(f"Scheduler setup failed: {e}")
 
 
     try:
-        logger.info("Running startup pipeline (7 days).")
-        await orchestrator.run_full_pipeline(days_ago=7, limit=50)
-        logger.info("Startup pipeline completed.")
+        if should_run_initial_backfill():
+            logger.info(
+                "Initial startup detected. Running %d-day backfill pipeline.",
+                STARTUP_BACKFILL_DAYS,
+            )
+            result = await orchestrator.run_startup_backfill(
+                days=STARTUP_BACKFILL_DAYS,
+                limit=STARTUP_LLM_LIMIT,
+            )
+            logger.info("Startup backfill completed: %s", result)
+        else:
+            logger.info(
+                "Startup backfill skipped (announcements already present). "
+                "Daily cron will continue incremental processing."
+            )
     except Exception as e:
         logger.error(f"Startup pipeline failed: {e}", exc_info=True)
 
@@ -295,6 +302,7 @@ def get_ranking_summary(
         }
     return summary[0]
 
+@app.get("/calendar")
 def get_forthcoming_results():
     """Retrieves forthcoming results (today or future) from the calendar collection."""
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -309,22 +317,12 @@ def get_forthcoming_results():
     
     # Manual data preparation is minimal due to CalendarRecord model alignment
     return {"calendar": docs}
-    
-    # Fetch and sort by meeting date
-    docs = list(result_calendar_collection.find(query).sort("meeting_date_standard", 1))
-
-    # Normalize ticker key for compatibility across existing records.
-    for doc in docs:
-        if not doc.get("short_name") and doc.get("TICKER"):
-            doc["short_name"] = doc["TICKER"]
-
-    return {"calendar": docs}
 
 
 @app.post("/pipeline/run")
 async def run_full_pipeline_endpoint(
-    days_ago: int = Query(7),
-    limit: int = Query(50)
+    days_ago: int = Query(STARTUP_BACKFILL_DAYS),
+    limit: int = Query(STARTUP_LLM_LIMIT)
 ):
     if not orchestrator:
         raise HTTPException(503, "Pipeline orchestrator not initialized.")

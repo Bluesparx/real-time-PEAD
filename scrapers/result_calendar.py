@@ -139,7 +139,7 @@ async def scrape_forthcoming_results():
                     row = {
                         "scrip_code": item.get("scrip_Code", "").strip(),
                         "company_name": item.get("Long_Name", "").strip(),
-                        "TICKER": item.get("short_name", "").strip(),
+                        "short_name": item.get("short_name", "").strip(),
                         "meeting_date_raw": meeting_date_raw,
                         "meeting_date_standard": meeting_date_standard,
                         "bse_url": item.get("URL", "").strip(),

@@ -13,10 +13,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Replace with your actual API URL
 API_URL = "http://localhost:8000"
 
-# --- ENHANCED CSS ---
+
 st.markdown("""
     <style>
     .stMetric {
@@ -71,18 +70,17 @@ with st.sidebar:
         start_date = today - timedelta(days=3)
     elif time_period == "Last 30 Days":
         start_date = today - timedelta(days=30)
-    else: # Default: Last 7 Days
+    else: 
         start_date = today - timedelta(days=7)
     end_date = today
     
     st.divider()
     
-    # 2. Trading Signals (Simplified multiselect)
     st.subheader("Trading Signal")
     signal_filter = st.multiselect(
         "Include Signals",
         ["Strong Buy", "Buy", "Hold", "Sell", "Strong Sell"],
-        default=["Strong Buy", "Buy"] # Focus on opportunities
+        default=["Strong Buy", "Buy"]
     )
     
     st.divider()
@@ -94,20 +92,21 @@ with st.sidebar:
     
     st.caption("Data is currently filtered from {} to {}.".format(start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")))
 
-# --- HELPER FUNCTIONS ---
 def get_trading_signal(row):
     """Trading signal logic based ONLY on the single ranking_score."""
-    ranking_score = row.get('ranking_score', 0)
-    
+    ranking_score = pd.to_numeric(row.get('ranking_score'), errors='coerce')
+    if pd.isna(ranking_score):
+        return "Hold", "Hold", "#9e9e9e"
+
     if ranking_score > 0.4:
-        # High ranking score indicates strong qualitative assessment and positive price reaction
+        
         return "Strong Buy", "Strong Buy", "#00c853"
     elif ranking_score > 0.1:
         return "Buy", "Buy", "#ffd600"
-    elif ranking_score < -0.1:
-        return "Sell", "Sell", "#ff5252"
     elif ranking_score < -0.4:
         return "Strong Sell", "Strong Sell", "#424242"
+    elif ranking_score < -0.1:
+        return "Sell", "Sell", "#ff5252"
     else:
         return "Hold", "Hold", "#9e9e9e"
 
@@ -134,6 +133,12 @@ def format_percentage(value):
         return "N/A"
     return f"{value:.2f}%"
 
+
+def format_score(value, precision=4):
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{value:.{precision}f}"
+
 # --- DATA FETCHERS ---
 @st.cache_data(ttl=300)
 def get_rankings_data(start_date, end_date):
@@ -159,8 +164,10 @@ if rankings_data and rankings_data.get('rankings'):
     df = pd.DataFrame(rankings_data['rankings'])
     
     # --- DATA PROCESSING ---
+    df['ranking_score'] = pd.to_numeric(df.get('ranking_score'), errors='coerce')
+    df['sentiment'] = pd.to_numeric(df.get('sentiment'), errors='coerce')
     df['signal'], df['signal_label'], df['signal_color'] = zip(*df.apply(get_trading_signal, axis=1))
-    df['sentiment_label'] = df['sentiment']
+    df['sentiment_label'] = df['sentiment'].apply(get_sentiment_label)
     
     # Robust date parsing
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
@@ -185,7 +192,7 @@ if rankings_data and rankings_data.get('rankings'):
         ]
     
     # Final sorting based on the ranking score
-    filtered_df = filtered_df.sort_values('ranking_score', ascending=False)
+    filtered_df = filtered_df.sort_values('ranking_score', ascending=False, na_position='last')
     
     # ADDED: Calculate rank on the frontend after final sorting
     filtered_df['rank'] = range(1, len(filtered_df) + 1) 
@@ -209,7 +216,7 @@ if rankings_data and rankings_data.get('rankings'):
                 'Signal': row['signal'],
                 'Company': row['company'],
                 'Date': row['date'].strftime('%d-%b'),
-                'Ranking Score': f"{row['ranking_score']:.4f}",
+                'Ranking Score': format_score(row['ranking_score']),
                 'Sentiment': row['sentiment_label'],
                 'Revenue': format_currency(row.get('revenue_current')),
                 'Rev YoY': format_percentage(row.get('revenue_yoy_change')),
@@ -248,9 +255,9 @@ if rankings_data and rankings_data.get('rankings'):
             with col1:
                 st.metric("Signal", company_data['signal'])
             with col2:
-                st.metric("Ranking Score", f"{company_data['ranking_score']:.4f}")
+                st.metric("Ranking Score", format_score(company_data['ranking_score']))
             with col3:
-                st.metric("Sentiment Score", f"{company_data.get('sentiment', 0):.3f}")
+                st.metric("Sentiment Score", format_score(company_data.get('sentiment'), precision=3))
             
             st.divider()
             
@@ -291,7 +298,7 @@ if rankings_data and rankings_data.get('rankings'):
             # Select and rename columns for display
             display_cal_df = cal_df.rename(columns={
                 'company_name': 'Company Name',
-                'TICKER': 'Ticker',
+                'short_name': 'Ticker',
                 'meeting_date_standard': 'Meeting Date',
                 'meeting_date_raw': 'Raw Date',
                 'scrip_code': 'Scrip Code',

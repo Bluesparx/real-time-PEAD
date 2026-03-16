@@ -50,6 +50,25 @@ def get_mongo_client():
         logger.error(f"Failed to connect to MongoDB: {e}")
         raise
 
+
+def ensure_announcements_index(collection):
+    """Ensure the announcements compound index matches expected uniqueness."""
+    index_name = "date_1_company_1_title_1"
+    index_keys = [("date", 1), ("company", 1), ("title", 1)]
+
+    existing = collection.index_information().get(index_name)
+    if existing:
+        existing_unique = bool(existing.get("unique", False))
+        if existing_unique is not True:
+            logger.warning(
+                "Existing index '%s' is non-unique; recreating as unique.",
+                index_name,
+            )
+            collection.drop_index(index_name)
+
+    collection.create_index(index_keys, unique=True, background=True, name=index_name)
+
+
 def save_to_mongodb(mongo_client, records):
     """Save records to MongoDB using upsert to avoid duplicates."""
     if not records:
@@ -58,12 +77,7 @@ def save_to_mongodb(mongo_client, records):
     try:
         db = mongo_client[DB_NAME]
         collection = db[COLLECTION_NAME]
-        
-        collection.create_index(
-            [("date", 1), ("company", 1), ("title", 1)],
-            unique=True,
-            background=True
-        )
+        ensure_announcements_index(collection)
         
         operations = []
         for record in records:

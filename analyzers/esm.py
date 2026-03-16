@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""
-esm_pipeline.py
-
-Full clean rewrite of your ESM pipeline (FULL CLEAN VERSION).
-- Single Gemini call for batch ranking of insights.
-- Keeps DB document structure unchanged (history under price docs,
-  insights documents preserved with `_id`).
-- Compact imports, removed unused helpers and unused metrics.
-"""
 
 import os
 import time
@@ -26,9 +17,7 @@ from bson.objectid import ObjectId
 
 from google import genai
 
-# ---------------------------
 # Configuration & Logging
-# ---------------------------
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_DATE = datetime.now().strftime("%Y-%m-%d")
@@ -54,17 +43,15 @@ MARKET_TICKER = os.getenv("MARKET_TICKER", "BSE-200.BO")
 ESTIMATION_WINDOW = int(os.getenv("ESTIMATION_WINDOW", "200"))
 EVENT_WINDOW_DAYS = int(os.getenv("EVENT_WINDOW_DAYS", "7"))
 
-# Gemini / GenAI client
+# Gemini
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyA5dlO-h-uv5XBEuRpzBXj1l8qOzp9oyow")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDoh7UvdkEtw7bXncNIJxrCROpxO_LW7Fk")
 if not GEMINI_API_KEY:
     logger.warning("GEMINI_API_KEY not set in environment. Set GEMINI_API_KEY before running.")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
-# ---------------------------
 # Utilities
-# ---------------------------
 def get_mongo_client() -> MongoClient:
     client = MongoClient(MONGO_URI)
     try:
@@ -78,10 +65,7 @@ def get_mongo_client() -> MongoClient:
 def date_to_string(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d")
 
-
-# ---------------------------
 # Stock Price Manager
-# ---------------------------
 class StockPriceManager:
     def __init__(self, mongo_uri: str = MONGO_URI, db_name: str = DB_NAME):
         self.client = MongoClient(mongo_uri)
@@ -186,9 +170,7 @@ class StockPriceManager:
         return doc.get("history", [])
 
 
-# ---------------------------
 # ESM Calculator (Batch LLM Ranking)
-# ---------------------------
 class ESMCalculator:
     def __init__(self, mongo_uri: str = MONGO_URI, db_name: str = DB_NAME):
         self.client = MongoClient(mongo_uri)
@@ -199,9 +181,7 @@ class ESMCalculator:
         self._price_cache: Dict[str, pd.DataFrame] = {}
         self.market_ticker = MARKET_TICKER
 
-    # ---------------------------
     # Price helpers
-    # ---------------------------
     def _fetch_price_df(self, ticker: str) -> Optional[pd.DataFrame]:
         """Load price history from Mongo and cache as DataFrame indexed by datetime."""
         if not ticker:
@@ -282,9 +262,6 @@ class ESMCalculator:
             result["event_days"] = 0
         return result
 
-    # ---------------------------
-    # Single Gemini batch call
-    # ---------------------------
     def _get_batch_llm_rankings(self, insights_batch: List[Dict[str, Any]]) -> Dict[str, float]:
         """
         Calls Gemini ONCE with all insights and returns mapping: { insight_id_str: ranking_score }.
@@ -332,8 +309,6 @@ class ESMCalculator:
                 }
             )
 
-        # Build the LLM prompt
-        # Keep the instructions strict: JSON array of {id, ranking_score}
         prompt = (
             "You are an expert financial analyst. You will be given a JSON array of earnings events.\n"
             "For each event, produce a single 'ranking_score' between -1.0 (worst) and 1.0 (best).\n"
@@ -367,9 +342,6 @@ class ESMCalculator:
             logger.error(f"Gemini batch ranking call failed: {e}")
             return {}
 
-    # ---------------------------
-    # Run bulk analysis (entrypoint)
-    # ---------------------------
     def run_bulk_analysis(self, start_date_str: str, end_date_str: str) -> List[Dict[str, Any]]:
         """
         High-level: fetch unranked insights in date range, compute a single batch Gemini call
@@ -410,10 +382,8 @@ class ESMCalculator:
             sentiment = ins.get("sentiment_score", 0)
 
             score = float(ranking_map.get(ins_id_str, 0.0))
-            # determine esm_ticker (best-effort): prefer existing field, otherwise attempt using metrics.ticker
             esm_ticker = ins.get("esm_ticker") or metrics.get("ticker") or None
 
-            # update original insight doc with ranking_score and esm_ticker
             insights_update_ops.append(
                 UpdateOne(
                     {"_id": ins_id},
@@ -424,7 +394,6 @@ class ESMCalculator:
                 )
             )
 
-            # final flattened doc for rankings collection (preserve _id)
             final_doc = {
                 "_id": ins_id,
                 "company": company,
@@ -463,8 +432,6 @@ class ESMCalculator:
         for idx, r in enumerate(results):
             r["rank"] = idx + 1
 
-        # Optionally: produce a short rationale using Gemini for the top results (single extra call)
-        # Keep this optional and lightweight. If you want it enabled, set environment var GENERATE_COMPARISON_RATIONALE=true
         if os.getenv("GENERATE_COMPARISON_RATIONALE", "false").lower() in ("1", "true", "yes"):
             try:
                 top_for_rationale = results[:10]
@@ -486,9 +453,6 @@ class ESMCalculator:
         return results
 
 
-# ---------------------------
-# External wrapper functions (pipeline entrypoints)
-# ---------------------------
 def run_esm_backfill(ticker_list: List[str], start_date: Optional[str] = None, end_date: Optional[str] = None):
     """
     Backfill historical prices for given tickers using StockPriceManager.
@@ -535,9 +499,6 @@ def esm_already_exists_for_today():
         logger.error(f"Error checking if Ranking exists for today: {e}")
         return False
 
-# ---------------------------
-# CLI
-# ---------------------------
 if __name__ == "__main__":
     import argparse
 

@@ -16,7 +16,6 @@ import numpy as np
 from PIL import Image
 import io
 
-# Use os.getenv for token, falling back to 'hf' placeholder if not set
 os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN", "hf")
 logger = logging.getLogger("llm_analyzer")
 
@@ -27,7 +26,6 @@ LLM_MODEL_ID = "openai/gpt-oss-120b"
 FINBERT_READY = False
 try:
     FINBERT_TOKENIZER = AutoTokenizer.from_pretrained(FINBERT_MODEL)
-    # Ensure model is moved to GPU/CPU only once
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     FINBERT_MODEL_CLASS = AutoModelForSequenceClassification.from_pretrained(FINBERT_MODEL).to(device)
     FINBERT_READY = True
@@ -87,29 +85,24 @@ class TextPreProcessor:
         self.text = self.text.replace("--- End of Page ---", "\n*** NEW PAGE ***\n")
 
     def _clean_lines(self):
-        # Remove standalone single character lines (often noise)
         self.text = re.sub(r"\n[a-zA-Z0-9]\n", "\n", self.text)
         self.text = re.sub(r"\[", "(", self.text)
 
     def _fix_tables(self):
-        # Consolidate split numbers/decimals within tables
         self.text = re.sub(r"\n\s*(\d{1,3}(?:,\d{3})*\.\d{2})\s*\n", r" \1 ", self.text)
         self.text = re.sub(r"\n\s*(\d{1,3}(?:,\d{3})*\.\d{2})\s*\(", r" (\1", self.text)
-        # Fix numbers split across lines (e.g., 1\n234)
+        
         self.text = re.sub(r"(\d)\n(\d)", r"\1 \2", self.text)
 
     def _group_paragraphs(self):
-        # Standardize triple newlines to mark paragraph breaks
         self.text = re.sub(r"\n\s*\n\s*\n+", "||P||", self.text)
-        # Collapse remaining newlines into spaces
         self.text = self.text.replace("\n", " ")
-        # Restore paragraph breaks
         self.text = self.text.replace("||P||", "\n\n")
         self.text = re.sub(r"\s{2,}", " ", self.text).strip()
 
 
 class PDFTextProcessor:
-    """Handles PDF downloading, text/OCR extraction, and storage of parsed text."""
+    
     def __init__(self, db: MongoClient):
         self.ann = db["announcements"]
         self.parsed = db["parsed_pdfs"]
@@ -134,16 +127,14 @@ class PDFTextProcessor:
         return None
 
     def _preprocess_image(self, image):
-        # Convert to numpy array and grayscale
+        
         gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
-        # Denoising
         den = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
-        # Thresholding (Otsu's method)
         _, th = cv2.threshold(den, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         return Image.fromarray(th)
 
     def _is_table(self, text):
-        # Simple heuristic to detect table-like text (many numbers per line)
+        
         lines = text.split("\n")
         for line in lines:
             numbers = sum(1 for w in line.split() if any(c.isdigit() for c in w))
@@ -156,7 +147,6 @@ class PDFTextProcessor:
         full_text = ""
         for i, page in enumerate(doc):
             text = page.get_text()
-            # If text is empty or suspected to be a table (poor extraction), run OCR
             if not text.strip() or self._is_table(text):
                 pix = page.get_pixmap(dpi=300)
                 img = Image.open(io.BytesIO(pix.tobytes("png")))
@@ -211,7 +201,6 @@ class PDFTextProcessor:
             }
             res = self.parsed.insert_one(doc)
             
-            # Update original announcement record
             self.ann.update_one({"_id": ObjectId(ann_id)}, {"$set": {"pdf_text_id": str(res.inserted_id), "pdf_processed_status": "SUCCESS"}})
             
             return {"status": "success", "id": str(res.inserted_id)}
@@ -223,14 +212,13 @@ class PDFTextProcessor:
     def process_batch(self, limit=50):
         """Finds announcements without parsed text and processes their PDFs."""
         
-        # Find announcements that have a PDF URL but no associated parsed text ID
-        q = self.ann.find(
-            {"pdf_url": {"$exists": True, "$ne": None, "$ne": ""}, 
+        announcements = list(self.ann.find(
+            {"pdf_url": {"$exists": True, "$ne": None, "$ne": ""},
              "pdf_text_id": {"$exists": False}}
-        ).limit(limit)
-        
+        ).limit(limit))
+
         out = []
-        for ann in q:
+        for ann in announcements:
             r = self.process_pdf(str(ann["_id"]), ann["pdf_url"])
             out.append({"announcement_id": str(ann["_id"]), "company": ann.get("company"), "result": r})
             
@@ -251,7 +239,7 @@ class LLMAnalyzer:
         self.pdf_processor = PDFTextProcessor(db) 
         
         self.GEMINI_MODEL = "gemini-2.5-flash" 
-        self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY", "AIzaSyA5dlO-h-uv5XBEuRpzBXj1l8qOzp9oyow"))
+        self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY", "AIzaSyDoh7UvdkEtw7bXncNIJxrCROpxO_LW7Fk"))
 
     def get_structured_output_from_llm(self, text: str, title: str) -> Optional[Dict[str, Any]]:
         prompt = f"""
@@ -392,16 +380,12 @@ Analyze the following text:
         
         out = []
         
-        # Use the results from the batch process to focus on recently updated announcements
-        # We need to find the corresponding PDF text ID (pdf_text_id) for these announcements
         
-        # Fallback query to find parsed PDFs that still need analysis
-        # Find PDF documents where 'text' exists, but whose announcement_id isn't in 'analyzed_ann_ids'
-        q = self.parsed_pdfs.find(
-             {"text": {"$exists": True, "$ne": None}}
-        ).limit(limit)
-        
-        for pdf in q:
+        parsed_pdfs = list(self.parsed_pdfs.find(
+            {"text": {"$exists": True, "$ne": None}}
+        ).limit(limit))
+
+        for pdf in parsed_pdfs:
             pid = str(pdf["_id"])
             
             # Check if any linked announcement ID for this PDF already has an insight

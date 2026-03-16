@@ -58,7 +58,7 @@ class PipelineOrchestrator:
             logger.error(f"Error in ESM analysis: {e}", exc_info=True)
             return []
 
-    # --- Full Pipeline ---
+    # --- Core Pipeline ---
     async def run_full_pipeline(self, days_ago: int = 7, limit: int = 50, skip_scraper=False):
         logger.info("=" * 80)
         logger.info("STARTING FULL PIPELINE")
@@ -94,5 +94,16 @@ class PipelineOrchestrator:
             "scraper": scraper_stats,
             "llm_analysis_count": len(llm_results),
             "esm_analysis_count": len(esm_results),
+            "days_ago": days_ago,
             "timestamp": datetime.now()
         }
+
+    # --- Startup Backfill ---
+    async def run_startup_backfill(self, days: int = 30, limit: int = 200):
+        logger.info("Running startup backfill pipeline for last %s days", days)
+        return await self.run_full_pipeline(days_ago=days, limit=limit, skip_scraper=False)
+
+    # --- Daily Job ---
+    async def run_daily_pipeline(self, limit: int = 100):
+        logger.info("Running daily pipeline for today's announcements")
+        return await self.run_full_pipeline(days_ago=1, limit=limit, skip_scraper=False)
